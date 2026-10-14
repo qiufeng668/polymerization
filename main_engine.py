@@ -291,11 +291,15 @@ def deduplicate_and_speedtest(raw_nodes):
     else:
         print(f"🎯 真连接测速完成！存活真节点: {len(alive_nodes)} / {len(unique_nodes)} 条")
 
-    # 统一重命名打标
+    # 保留原节点名称打标
     final_nodes = []
     for idx, uri in enumerate(alive_nodes, 1):
-        base_part = uri.split("#")[0]
-        tag = quote_safe(f"⚡ 聚合节点_{idx:03d}")
+        parts = uri.split("#")
+        base_part = parts[0]
+        # 提取原名，如果没有原名则用序号保底
+        original_name = unquote(parts[1]) if len(parts) > 1 else f"节点_{idx:03d}"
+        # 在原名称前加个闪电符号以示区分，保留国家地区信息
+        tag = quote_safe(f"⚡ {original_name}")
         final_nodes.append(f"{base_part}#{tag}")
 
     # 导出 1：明文列表 (nodes.txt)
