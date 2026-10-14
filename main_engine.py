@@ -193,7 +193,7 @@ def run_plugins_with_cache():
                 proc = subprocess.run(
                     ["python", script_name],
                     cwd=SANDBOX_DIR,
-                    capture_output=True,
+                    capture_output=False,
                     text=True,
                     timeout=300 # 单个脚本最长允许跑 5 分钟
                 )
