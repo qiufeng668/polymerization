@@ -39,8 +39,8 @@ def decrypt_node(content_b64: str, ts_str: str, rid: str, token: str):
     try:
         pt = unpad(aes.decrypt(base64.b64decode(content_b64)), 16)
         return pt.decode("utf-8", errors="replace"), key
-    except Exception:
-        return None, key
+    except Exception as e:
+        return f"DECRYPT_ERROR: {e}", key
 
 def build_key(ts_str: str, rid: str, token: str) -> str:
     L = len(ts_str)
@@ -96,19 +96,38 @@ def request(path: str, params: dict, token: str = "", serial: str = "") -> dict:
             "requestId": p["requestId"]
         }
 
-def to_trojan_link(plain: str, name: str = "") -> str:
-    if not plain:
+def parse_any_node(plain: str, name: str = "") -> str:
+    """放宽协议限制的万能解析器"""
+    if not plain or plain.startswith("DECRYPT_ERROR"):
         return ""
+    
+    # 如果解密出来直接就是标准 URI，直接返回
+    if plain.startswith(("vmess://", "vless://", "trojan://", "ss://", "ssr://")):
+        return f"{plain}#{quote(name)}" if name else plain
+
+    # 如果是逗号分隔格式，尝试解析
     parts = plain.split(',')
-    if len(parts) < 5:
-        return ""
-    proto, server, port, password, method = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip(), parts[4].strip()
-    if proto.lower() != "trojan":
-        return ""
-    link = f"trojan://{password}@{server}:{port}?encryption={method}"
-    if name:
-        link += f"#{quote(name)}"
-    return link
+    if len(parts) >= 4:
+        proto = parts[0].strip().lower()
+        server = parts[1].strip()
+        port = parts[2].strip()
+        pwd = parts[3].strip()
+        
+        link = ""
+        if proto == "trojan":
+            method = parts[4].strip() if len(parts) > 4 else "none"
+            link = f"trojan://{pwd}@{server}:{port}?encryption={method}"
+        elif proto == "ss":
+            method = parts[4].strip() if len(parts) > 4 else "aes-256-gcm"
+            userinfo = base64.urlsafe_b64encode(f"{method}:{pwd}".encode()).decode().rstrip("=")
+            link = f"ss://{userinfo}@{server}:{port}"
+        elif proto == "vless":
+            link = f"vless://{pwd}@{server}:{port}?encryption=none"
+            
+        if link:
+            return f"{link}#{quote(name)}" if name else link
+            
+    return ""
 
 def fetch_all_nodes(serial: str, delay: float = 2.0) -> str:
     request("/server/info", {}, serial=serial)
@@ -139,24 +158,24 @@ def fetch_all_nodes(serial: str, delay: float = 2.0) -> str:
             except Exception:
                 if attempt < 2:
                     time.sleep(delay * 1.5)
+        
         if content:
             pt, key = decrypt_node(content, r["requestTimestamp"], r["requestId"], token)
-        node["_plain"] = pt
-        if pt:
-            link = to_trojan_link(pt, node.get("name", ""))
+            # 【关键排错】：直接把解密后的明文打印出来！
+            print(f"👉 [{node.get('name', '未命名')}] 解密明文: {pt}")
+            
+            link = parse_any_node(pt, node.get("name", ""))
             if link:
                 node_links.append(link)
+                
         if i < len(nodes) - 1:
             time.sleep(delay)
 
-    # 保存为当前目录文件（沙盒会自动收集）
-    with open("output_nodes.json", "w", encoding="utf-8") as f:
-        json.dump(nodes, f, ensure_ascii=False, indent=2)
-
+    # 只要生成了文本，哪怕里面是奇奇怪怪的明文，也让主程序先接手处理
     with open("output_nodes.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(node_links))
 
-    print(f"已生成节点文件: output_nodes.txt（共 {len(node_links)} 条）")
+    print(f"已生成节点文件: output_nodes.txt（共提取到 {len(node_links)} 条标准链接）")
     return token
 
 def main():
