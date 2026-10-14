@@ -46,10 +46,12 @@ jobs:
       - name: 6. 自动将存活节点转换为 Clash 配置文件
         run: |
           if [ -f vault_repo/sub_base64.txt ]; then
-            ./subconverter/subconverter -g &
+            cp vault_repo/sub_base64.txt subconverter/sub_base64.txt
+            cd subconverter
+            ./subconverter -g &
             sleep 2
-            # 调用本地 subconverter 将生成的 Base64 转为完整的 Clash 配置
-            curl -s "http://127.0.0.1:25500/sub?target=clash&url=$(pwd)/vault_repo/sub_base64.txt&insert=false" -o vault_repo/clash.yaml || true
+            curl -s "http://127.0.0.1:25500/sub?target=clash&url=sub_base64.txt&insert=false" -o ../vault_repo/clash.yaml || true
+            cd ..
           fi
 
       - name: 7. 使用 Git Token 覆盖推送到私有库 (无历史垃圾防膨胀)
