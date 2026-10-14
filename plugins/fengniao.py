@@ -8,17 +8,40 @@ import os
 import sys
 import time
 import uuid
-from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.parse import quote
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-API = "https://api.go01.top/proxy"
+# ---------- 固定配置（按用户要求） ----------
+API_BASE = "https://api.go01.top/proxy"
 AES_IV = b"A-16-Byte-String"
+DEFAULT_DELAY = 1.5
 
+# 输出目录（脚本所在目录，兼容 CI 与本地）
+try:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _SCRIPT_DIR = os.getcwd()
+OUTPUT_DIR = _SCRIPT_DIR + "/"
+# 固定文件名
+DATA_JSON = "fengniao_data.json"
+NODES_TXT = "fengniao.txt"
+TOKEN_CACHE_FILE = ".fengniao_token_cache.json"   # 仍放在输出目录下
+
+# ---------- 工具函数 ----------
 def md5(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()
+
+def gen_serial() -> str:
+    return base64.b64encode(uuid.uuid4().bytes + uuid.uuid4().bytes[:16]).decode()
 
 def build_decrypt_key(ts_str: str, rid: str, token: str) -> str:
     if int(ts_str) % 2 == 0:
@@ -39,8 +62,8 @@ def decrypt_node(content_b64: str, ts_str: str, rid: str, token: str):
     try:
         pt = unpad(aes.decrypt(base64.b64decode(content_b64)), 16)
         return pt.decode("utf-8", errors="replace"), key
-    except Exception as e:
-        return f"DECRYPT_ERROR: {e}", key
+    except Exception:
+        return None, key
 
 def build_key(ts_str: str, rid: str, token: str) -> str:
     L = len(ts_str)
@@ -53,9 +76,7 @@ def build_key(ts_str: str, rid: str, token: str) -> str:
     k8 += (token[idx] if token else rid[idx])
     return k8
 
-def gen_serial() -> str:
-    return base64.b64encode(uuid.uuid4().bytes + uuid.uuid4().bytes[:16]).decode()
-
+# ---------- 请求签名 ----------
 def make_sign(params: dict, token: str, serial: str) -> tuple:
     now = int(time.time() * 1000)
     rid = uuid.uuid4().hex
@@ -77,111 +98,220 @@ def make_sign(params: dict, token: str, serial: str) -> tuple:
     sign = md5(ps + key)
     return p, sign
 
-def request(path: str, params: dict, token: str = "", serial: str = "") -> dict:
+def api_request(path: str, params: dict, token: str = "", serial: str = "") -> dict:
     p, sign = make_sign(params, token, serial)
     boundary = uuid.uuid4().hex
     parts = []
     for k, v in {**p, "sign": sign}.items():
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n')
     data = ("".join(parts) + f"--{boundary}--\r\n").encode()
-    req = Request(f"{API}{path}", data=data, method="POST")
+    req = Request(f"{API_BASE}{path}", data=data, method="POST")
     req.add_header("User-Agent", "okhttp-okgo/jeasonlzy")
     req.add_header("Accept-Language", "zh-CN,zh;q=0.8")
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    with urlopen(req, timeout=10) as r:
-        return {
-            "status": r.status,
-            "body": r.read().decode("utf-8", "replace"),
-            "requestTimestamp": p["requestTimestamp"],
-            "requestId": p["requestId"]
-        }
+    try:
+        with urlopen(req, timeout=15) as r:
+            return {
+                "status": r.status,
+                "body": r.read().decode("utf-8", "replace"),
+                "requestTimestamp": p["requestTimestamp"],
+                "requestId": p["requestId"]
+            }
+    except Exception as e:
+        return {"status": -1, "body": str(e), "requestTimestamp": "", "requestId": ""}
 
-def parse_any_node(plain: str, name: str = "") -> str:
-    """放宽协议限制的万能解析器"""
-    if not plain or plain.startswith("DECRYPT_ERROR"):
-        return ""
-    
-    # 如果解密出来直接就是标准 URI，直接返回
-    if plain.startswith(("vmess://", "vless://", "trojan://", "ss://", "ssr://")):
-        return f"{plain}#{quote(name)}" if name else plain
-
-    # 如果是逗号分隔格式，尝试解析
+# ---------- 协议转换 ----------
+def to_trojan_link(plain: str, name: str = "") -> str:
     parts = plain.split(',')
-    if len(parts) >= 4:
-        proto = parts[0].strip().lower()
-        server = parts[1].strip()
-        port = parts[2].strip()
-        pwd = parts[3].strip()
-        
-        link = ""
-        if proto == "trojan":
-            method = parts[4].strip() if len(parts) > 4 else "none"
-            link = f"trojan://{pwd}@{server}:{port}?encryption={method}"
-        elif proto == "ss":
-            method = parts[4].strip() if len(parts) > 4 else "aes-256-gcm"
-            userinfo = base64.urlsafe_b64encode(f"{method}:{pwd}".encode()).decode().rstrip("=")
-            link = f"ss://{userinfo}@{server}:{port}"
-        elif proto == "vless":
-            link = f"vless://{pwd}@{server}:{port}?encryption=none"
-            
-        if link:
-            return f"{link}#{quote(name)}" if name else link
-            
-    return ""
-
-def fetch_all_nodes(serial: str, delay: float = 2.0) -> str:
-    request("/server/info", {}, serial=serial)
-
-    r = request("/user/auto/login", {}, serial=serial)
-    body = json.loads(r["body"])
-    if body.get("code") != 0:
-        print(f"登录失败: {r['body']}")
+    if len(parts) < 5:
         return ""
-    if "data" not in body or "token" not in body.get("data", {}):
-        print("风控提示: 服务端返回 code:0 但未发放 token。")
+    proto, server, port, password, method = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip(), parts[4].strip()
+    if proto.lower() != "trojan":
         return ""
-    token = body["data"]["token"]
-    print(f"Token 获取成功: {token[:10]}...")
+    link = f"trojan://{password}@{server}:{port}?encryption={method}"
+    if name:
+        link += f"#{quote(name)}"
+    return link
 
-    r = request("/user/fetch/node/list", {"vipType": "vip"}, token=token, serial=serial)
-    nodes = json.loads(r["body"]).get("data", [])
-    print(f"共发现 {len(nodes)} 个节点")
+def to_vmess_link(plain: str, name: str = "") -> str:
+    parts = plain.split(',')
+    if len(parts) < 6 or parts[0].lower() != "vmess":
+        return ""
+    config = {
+        "v": "2",
+        "ps": name or "蜂鸟",
+        "add": parts[1].strip(),
+        "port": parts[2].strip(),
+        "id": parts[3].strip(),
+        "aid": parts[4].strip() if len(parts) > 4 else "0",
+        "net": parts[6].strip() if len(parts) > 6 else "tcp",
+        "type": parts[7].strip() if len(parts) > 7 else "none",
+        "host": parts[8].strip() if len(parts) > 8 else "",
+        "path": parts[9].strip() if len(parts) > 9 else "",
+        "tls": "tls" if len(parts) > 10 and parts[10].strip().lower() == "tls" else "",
+    }
+    return "vmess://" + base64.b64encode(json.dumps(config).encode()).decode()
 
-    node_links = []
-    for i, node in enumerate(nodes):
-        content, pt, key = "", None, ""
-        for attempt in range(3):
-            r = request("/user/fetch/node/detail", {"nodeId": node["id"]}, token=token, serial=serial)
+def to_ss_link(plain: str, name: str = "") -> str:
+    parts = plain.split(',')
+    if len(parts) < 4 or parts[0].lower() != "ss":
+        return ""
+    method, password, server, port = parts[1].strip(), parts[2].strip(), parts[3].strip(), parts[4].strip() if len(parts)>4 else "443"
+    userinfo = base64.b64encode(f"{method}:{password}".encode()).decode()
+    link = f"ss://{userinfo}@{server}:{port}"
+    if name:
+        link += f"#{quote(name)}"
+    return link
+
+def convert_plain_to_links(plain: str, name: str, protocols: list) -> list:
+    if not plain:
+        return []
+    links = []
+    proto = plain.split(',')[0].strip().lower()
+    if "trojan" in protocols and proto == "trojan":
+        l = to_trojan_link(plain, name)
+        if l: links.append(l)
+    if "vmess" in protocols and proto == "vmess":
+        l = to_vmess_link(plain, name)
+        if l: links.append(l)
+    if "ss" in protocols and proto == "ss":
+        l = to_ss_link(plain, name)
+        if l: links.append(l)
+    return links
+
+# ---------- 主流程 ----------
+def fetch_nodes(serial: str, delay: float, protocols: list, cache_token: bool):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    cache_path = os.path.join(OUTPUT_DIR, TOKEN_CACHE_FILE)
+
+    token = ""
+    if cache_token and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+                if data.get("serial") == serial:
+                    token = data.get("token", "")
+                    print(f"使用缓存的 token (serial={serial[:8]}...)")
+        except:
+            pass
+
+    if not token:
+        print("== server/info ==")
+        api_request("/server/info", {}, serial=serial)
+
+        print("== user/auto/login ==")
+        r = api_request("/user/auto/login", {}, serial=serial)
+        if r["status"] != 200:
+            print("登录请求失败:", r["body"])
+            return
+        try:
+            body = json.loads(r["body"])
+        except:
+            print("响应解析失败:", r["body"][:200])
+            return
+        if body.get("code") != 0:
+            print("登录失败:", body.get("msg", r["body"][:200]))
+            return
+        if "data" not in body or "token" not in body.get("data", {}):
+            print("风控提示: 服务端返回 code:0 但未发放 token，请稍后重试或用 --serial 指定已有账号")
+            return
+        token = body["data"]["token"]
+        print(f"获取新 token: {token[:8]}... (registerGift: {body['data'].get('registerGift')})")
+
+        if cache_token:
+            with open(cache_path, "w") as f:
+                json.dump({"serial": serial, "token": token}, f)
+            print(f"token 已缓存至 {cache_path}")
+
+    print("== user/my/info ==")
+    r = api_request("/user/my/info", {}, token=token, serial=serial)
+    try:
+        info = json.loads(r["body"])["data"]
+        print(f"  账号 {info.get('account')}  vipEndTime={info.get('vipEndTime')}  recommenderId={info.get('recommenderId')}")
+    except:
+        pass
+
+    print("== user/fetch/node/list ==")
+    r = api_request("/user/fetch/node/list", {"vipType": "vip"}, token=token, serial=serial)
+    if r["status"] != 200:
+        print("节点列表请求失败:", r["body"][:200])
+        return
+    try:
+        nodes = json.loads(r["body"])["data"]
+    except:
+        print("节点列表解析失败:", r["body"][:200])
+        return
+    print(f"共 {len(nodes)} 个节点，仅处理协议: {protocols}，详情间隔 {delay}s")
+
+    all_links = []
+    results = []
+
+    iterator = tqdm(nodes, desc="拉取节点") if HAS_TQDM else nodes
+    for idx, node in enumerate(iterator):
+        node_name = node.get("name", f"节点{idx+1}")
+        plain = None
+        for attempt in range(4):
+            r = api_request("/user/fetch/node/detail", {"nodeId": node["id"]}, token=token, serial=serial)
+            if r["status"] != 200:
+                if attempt < 3:
+                    time.sleep(delay * (attempt + 1))
+                    continue
+                else:
+                    print(f"  {node_name}: 请求失败 {r['body'][:80]}")
+                    break
             try:
                 content = json.loads(r["body"])["data"]["content"]
-                break
-            except Exception:
-                if attempt < 2:
-                    time.sleep(delay * 1.5)
-        
-        if content:
-            pt, key = decrypt_node(content, r["requestTimestamp"], r["requestId"], token)
-            # 【关键排错】：直接把解密后的明文打印出来！
-            print(f"👉 [{node.get('name', '未命名')}] 解密明文: {pt}")
-            
-            link = parse_any_node(pt, node.get("name", ""))
-            if link:
-                node_links.append(link)
-                
-        if i < len(nodes) - 1:
+                plain, key = decrypt_node(content, r["requestTimestamp"], r["requestId"], token)
+                if plain:
+                    break
+                else:
+                    if attempt < 3:
+                        time.sleep(delay * (attempt + 1))
+                    else:
+                        print(f"  {node_name}: 解密失败 (key={key})")
+            except Exception as e:
+                if attempt < 3:
+                    time.sleep(delay * (attempt + 1))
+                else:
+                    print(f"  {node_name}: 异常 {e}")
+        if plain:
+            links = convert_plain_to_links(plain, node_name, protocols)
+            all_links.extend(links)
+            results.append({"name": node_name, "plain": plain, "links": links})
+            if HAS_TQDM:
+                iterator.set_postfix({"成功": node_name})
+        else:
+            results.append({"name": node_name, "plain": None, "links": []})
+        if idx < len(nodes) - 1:
             time.sleep(delay)
 
-    # 只要生成了文本，哪怕里面是奇奇怪怪的明文，也让主程序先接手处理
-    with open("output_nodes.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(node_links))
+    # 保存 JSON(fengniao_data.json)
+    json_path = os.path.join(OUTPUT_DIR, DATA_JSON)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"数据已保存至 {json_path}")
 
-    print(f"已生成节点文件: output_nodes.txt（共提取到 {len(node_links)} 条标准链接）")
-    return token
+    # 保存节点链接(fengniao.txt)
+    links_path = os.path.join(OUTPUT_DIR, NODES_TXT)
+    with open(links_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(all_links))
+    print(f"共生成 {len(all_links)} 条链接，保存至 {links_path}")
 
 def main():
-    serial = gen_serial()
-    print(f"生成新设备序列号: {serial}")
-    fetch_all_nodes(serial, delay=1.0)
+    import argparse
+    parser = argparse.ArgumentParser(description="蜂鸟加速器节点拉取（固定输出目录与文件名）")
+    parser.add_argument("--serial", help="指定序列号（默认随机生成）")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="节点请求间隔（秒）")
+    parser.add_argument("--protocol", default="trojan,vmess,ss", help="需要转换的协议，逗号分隔 (trojan,vmess,ss)")
+    parser.add_argument("--no-cache-token", action="store_true", help="禁用 token 缓存")
+    args = parser.parse_args()
+
+    serial = args.serial or gen_serial()
+    if not args.serial:
+        print(f"生成新序列号: {serial}")
+
+    protocols = [p.strip().lower() for p in args.protocol.split(",") if p.strip()]
+    fetch_nodes(serial, args.delay, protocols, not args.no_cache_token)
 
 if __name__ == "__main__":
     main()
