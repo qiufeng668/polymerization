@@ -1,0 +1,68 @@
+name: Auto Multi-Sub Aggregator
+
+on:
+  schedule:
+    # 每 50 分钟运行一次
+    - cron: '*/50 * * * *'
+  workflow_dispatch: # 允许手动点击运行测试
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出公开库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 拉取私有库(sub-vault)的历史状态与缓存
+        env:
+          TOKEN: ${{ secrets.MY_GIT_TOKEN }}
+          VAULT: ${{ secrets.VAULT_REPO }}
+        run: |
+          git clone "https://x-access-token:${TOKEN}@github.com/${VAULT}.git" vault_repo || mkdir -p vault_repo
+
+      - name: 3. 配置 Python 环境并安装依赖
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+
+      - name: 4. 下载真连接测速内核 (LiteSpeedTest) 与 Subconverter
+        run: |
+          # 下载 LiteSpeedTest 内核用于真连接测速 (Xray/Mihomo 内核驱动)
+          wget -qO lite.gz https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz || true
+          if [ -f lite.gz ]; then
+            gzip -d lite.gz
+            chmod +x lite
+          fi
+          # 下载 Subconverter 用于生成标准 Clash YAML 订阅
+          wget -qO subconverter.tar.gz https://github.com/tindy2013/subconverter/releases/latest/download/subconverter_linux64.tar.gz
+          tar -zxf subconverter.tar.gz
+
+      - name: 5. 运行主控引擎 (按需分频运行 PY + 去重 + 真测速)
+        run: |
+          python main_engine.py
+
+      - name: 6. 自动将存活节点转换为 Clash 配置文件
+        run: |
+          if [ -f vault_repo/sub_base64.txt ]; then
+            ./subconverter/subconverter -g &
+            sleep 2
+            # 调用本地 subconverter 将生成的 Base64 转为完整的 Clash 配置
+            curl -s "http://127.0.0.1:25500/sub?target=clash&url=$(pwd)/vault_repo/sub_base64.txt&insert=false" -o vault_repo/clash.yaml || true
+          fi
+
+      - name: 7. 使用 Git Token 覆盖推送到私有库 (无历史垃圾防膨胀)
+        env:
+          TOKEN: ${{ secrets.MY_GIT_TOKEN }}
+          VAULT: ${{ secrets.VAULT_REPO }}
+        run: |
+          cd vault_repo
+          rm -rf .git
+          git init
+          git config user.name "AggregatorBot"
+          git config user.email "bot@noreply.github.com"
+          git checkout -b main
+          git add .
+          git commit -m "Auto sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git push -f "https://x-access-token:${TOKEN}@github.com/${VAULT}.git" main
