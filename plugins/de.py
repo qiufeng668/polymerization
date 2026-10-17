@@ -11,6 +11,11 @@ import re
 依赖：
   - Python 3
   - 能访问外网
+
+Ed25519 已内嵌纯 Python 实现；cryptography / pynacl 仅作为可选加速，
+在 Juno / iOS 中无需安装。
+
+不需要其它本地文件、配置、数据库。
 """
 import base64
 import hashlib
@@ -200,6 +205,8 @@ def b58encode(data: bytes) -> str:
 # ================================================================
 # 内嵌：Ed25519（纯 Python 兜底，适配 Juno / iOS）
 # ================================================================
+# RFC 8032 Ed25519 参数。优先使用 cryptography / PyNaCl；若都不可用，
+# 自动使用下面的纯 Python 实现，因此 Juno 无需再安装原生扩展包。
 _ED_P = 2**255 - 19
 _ED_L = 2**252 + 27742317777372353535851937790883648493
 _ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
@@ -271,13 +278,20 @@ def _ed_sign(seed, public_key, msg):
     return R + S.to_bytes(32, "little")
 
 def ed25519_keypair():
+    """返回 (public_raw_32, sign_fn)，sign_fn(msg:bytes)->sig64。
+
+    在普通 Python 上优先使用 cryptography / PyNaCl；在 Juno/iOS 等
+    无法安装原生扩展的环境里，自动退回内嵌的纯 Python Ed25519。
+    """
     seed = os.urandom(32)
+
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         sk = Ed25519PrivateKey.from_private_bytes(seed)
         try:
             pub = sk.public_key().public_bytes_raw()
         except AttributeError:
+            # 兼容较旧 cryptography
             from cryptography.hazmat.primitives import serialization
             pub = sk.public_key().public_bytes(
                 encoding=serialization.Encoding.Raw,
@@ -286,6 +300,7 @@ def ed25519_keypair():
         return pub, (lambda msg, _sk=sk: _sk.sign(msg))
     except Exception:
         pass
+
     try:
         from nacl.signing import SigningKey
         sk = SigningKey(seed)
@@ -293,6 +308,8 @@ def ed25519_keypair():
         return pub, (lambda msg, _sk=sk: _sk.sign(msg).signature)
     except Exception:
         pass
+
+    # Juno / iOS 兜底：不需要 pip 安装任何第三方包
     pub = _ed_public_from_seed(seed)
     return pub, (lambda msg, _seed=seed, _pub=pub: _ed_sign(_seed, _pub, msg))
 
@@ -314,17 +331,21 @@ DOMAINS = [
     "https://sports.devpn.vip",
 ]
 
-_HERE = os.path.dirname(os.path.abspath(__file__)) or "."
-SAVE_DIR = _HERE
-OUT_FILE = os.path.join(SAVE_DIR, "nodes.txt")
-META_FILE = os.path.join(SAVE_DIR, "last_account.json")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if sys.platform.startswith("linux") and os.path.exists("/storage/emulated/0"):
+    SAVE_DIR = "/storage/emulated/0/Download/"          # Android (Termux)
+elif sys.platform == "win32":
+    SAVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+else:
+    SAVE_DIR = _HERE
 
+# 节点服务器是自签/非标准证书，关闭校验（与 App vpnBypassPost 行为一致）
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # ================================================================
-# 设备证明头
+# 设备证明头（一次生成，全程复用同一份 requestid）
 # ================================================================
 def make_headers(token, device_id, proof=None):
     device = {
@@ -362,6 +383,7 @@ def make_headers(token, device_id, proof=None):
     }
 
 def make_login_device_info(android_id):
+    """App getDeviceInfo() 字段（用于登录 fingerprint / nonce 查询）。"""
     return {
         "brand": DEVICE_BRAND,
         "deviceId": DEVICE_MODEL,
@@ -384,6 +406,10 @@ def pick_base(hdrs=None):
     return None
 
 def register_account(invite=DEFAULT_INVITE, android_id=None, claim_free=True):
+    """生成 Solana 密钥 → 登录拿新 dsf-token → 绑邀请码 → 领免费时长。
+
+    返回 dict: token / android_id / wallet / base / user / proof
+    """
     android_id = android_id or "".join(random.choice("0123456789abcdef") for _ in range(16))
     device_info = make_login_device_info(android_id)
     fingerprint = hashlib.sha256(
@@ -532,6 +558,8 @@ def get_countries(base, token, hdrs, residence=False):
         return []
 
 def activate_node(node):
+    """POST sm2ciphertext 到节点服务器的 /server/setAccount。
+    返回 True 表示激活成功（data:true）。"""
     domain = node.get("domainName")
     port = node.get("appPort") or "443"
     sm2 = node.get("sm2ciphertext") or ""
@@ -570,11 +598,16 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
 
 def normalize_uuid(value):
+    """兼容标准 UUID、32 位无横杠 UUID，以及少量带空白/大括号的返回值。"""
     s = str(value or "").strip().strip("{}")
     if not s:
         return None
+
+    # 标准 8-4-4-4-12
     if UUID_RE.match(s):
         return s.lower()
+
+    # 32 位十六进制，自动补横杠
     compact = s.replace("-", "")
     if re.fullmatch(r"[0-9a-fA-F]{32}", compact):
         return (
@@ -584,12 +617,15 @@ def normalize_uuid(value):
             compact[16:20] + "-" +
             compact[20:32]
         ).lower()
+
+    # 最后再交给 Python 自带 uuid 模块尝试解析
     try:
         return str(uuid.UUID(s))
     except Exception:
         return None
 
 def node_uuid(node):
+    # API 不同版本可能字段名不同，依次兼容
     for key in ("uuid", "userUuid", "userUUID", "accountUuid", "accountUUID", "vmessUuid", "vmessUUID", "id"):
         val = node.get(key)
         norm = normalize_uuid(val)
@@ -645,6 +681,18 @@ def vmess_link(node, name):
 
     raw = json.dumps(cfg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     link = "vmess://" + base64.b64encode(raw).decode("ascii")
+
+    # 自检
+    payload = link[len("vmess://"):]
+    check = json.loads(base64.b64decode(payload).decode("utf-8"))
+    required = ("v", "ps", "add", "port", "id", "aid", "scy", "net", "type", "host", "path", "tls", "sni")
+    if any(k not in check for k in required):
+        raise ValueError("VMess 自检缺少必要字段")
+    if check["add"] != check["host"] or check["add"] != check["sni"]:
+        raise ValueError("add/host/sni 不一致")
+    if not normalize_uuid(check["id"]):
+        raise ValueError("VMess UUID 自检失败")
+
     return link
 
 # ================================================================
@@ -653,17 +701,23 @@ def vmess_link(node, name):
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+INVITE = DEFAULT_INVITE
+HERE = os.path.dirname(os.path.abspath(__file__)) or "."
+OUT_FILE = os.path.join(HERE, "nodes.txt")
+META_FILE = os.path.join(HERE, "last_account.json")
 ROUNDS_PER_COUNTRY = 10
-MAX_NODES_PER_COUNTRY = 3 
+MAX_NODES_PER_COUNTRY = 3  # 每个国家最终最多保留 3 个可用节点
 COUNTRY_WORKERS = 7
 ACTIVATE_WORKERS = 16
 
 _print_lock = threading.Lock()
 _activate_pool = None
 
+
 def log(msg: str) -> None:
     with _print_lock:
         print(msg, flush=True)
+
 
 def activate_batch(nodes):
     ok = []
@@ -691,17 +745,21 @@ def activate_batch(nodes):
             pass
     return ok
 
+
 def harvest_country(base, token, hdrs, code, rounds=ROUNDS_PER_COUNTRY, max_nodes=MAX_NODES_PER_COUNTRY):
     bucket = {}
     log(f"开始 {code} …（最多保留 {max_nodes} 条）")
     rounds_used = 0
 
     for round_i in range(1, rounds + 1):
+        # 已经凑够就立即停止，不再继续请求后面的轮次
         if len(bucket) >= max_nodes:
             break
+
         rounds_used = round_i
         before = len(bucket)
         data = fetch_nodes(base, token, hdrs, code, residence=False)
+
         fresh = []
         seen_this_round = set()
         for n in data.get("data") or []:
@@ -709,6 +767,8 @@ def harvest_country(base, token, hdrs, code, rounds=ROUNDS_PER_COUNTRY, max_node
             if dn and dn not in bucket and dn not in seen_this_round:
                 seen_this_round.add(dn)
                 fresh.append(n)
+
+        # 激活本轮新节点，只收够 max_nodes 为止
         remaining = max_nodes - len(bucket)
         for n in activate_batch(fresh):
             dn = n.get("domainName")
@@ -716,20 +776,24 @@ def harvest_country(base, token, hdrs, code, rounds=ROUNDS_PER_COUNTRY, max_node
                 bucket[dn] = n
                 if len(bucket) >= max_nodes:
                     break
+
         gained = len(bucket) - before
         log(f"  {code}: 第{round_i}/{rounds}轮  累计{len(bucket)}/{max_nodes}  (+{gained})")
+
         if len(bucket) >= max_nodes:
             log(f"  {code}: 已凑够 {max_nodes} 条，提前停止")
             break
+
     log(f"  → {code} 完成 {len(bucket)} 条（实际跑 {rounds_used}/{rounds} 轮）")
     return code, bucket
+
 
 def main():
     global _activate_pool
     t0 = time.time()
 
     log("===== 1/3 注册新账号 =====")
-    acc = register_account(invite=DEFAULT_INVITE, claim_free=True)
+    acc = register_account(invite=INVITE, claim_free=True)
     token = acc["token"]
     device_id = acc["android_id"]
     log(f"token:  {token}")
@@ -817,5 +881,25 @@ def main():
         "token": token,
         "android_id": device_id,
         "wallet": acc["wallet"],
+        "invite": INVITE,
         "rounds_per_country": ROUNDS_PER_COUNTRY,
         "max_nodes_per_country": MAX_NODES_PER_COUNTRY,
+        "country_workers": COUNTRY_WORKERS,
+        "activate_workers": ACTIVATE_WORKERS,
+        "per_country": {k: len(val) for k, val in ordered.items()},
+        "total_links": len(links),
+        "elapsed_sec": round(elapsed, 1),
+        "nodes_file": OUT_FILE,
+    }
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    log(f"合计 {len(links)} 条 → {OUT_FILE}")
+    log(f"账号信息 → {META_FILE}")
+    log(f"耗时 {elapsed:.1f}s")
+    for k, n in meta["per_country"].items():
+        log(f"  {k}: {n}")
+
+
+if __name__ == "__main__":
+    main()
