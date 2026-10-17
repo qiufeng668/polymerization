@@ -2,14 +2,14 @@ name: Auto Multi-Sub Aggregator
 
 on:
   schedule:
-    # 每 50 分钟左右执行一次（GitHub Actions 定时任务语法）
+    # 每 50 分钟自动运行一次
     - cron: '*/50 * * * *'
-  workflow_dispatch: # 允许你在页面上手动点击按钮触发测试
+  workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮触发
 
 jobs:
   build-and-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 35 # 全局超时保护
+    timeout-minutes: 30
 
     steps:
       - name: 1. 检出公开库代码
@@ -32,9 +32,11 @@ jobs:
           gunzip -f lite.gz
           chmod +x lite
 
-      - name: 5. 运行主控引擎 (分频运行 PY + 失效监控 + 真测速 + 导出全格式)
+      - name: 5. 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python main_engine.py
+          python -u main_engine.py
 
       - name: 6. 使用 Git Token 覆盖推送到私有库 (无历史垃圾防膨胀)
         run: |
