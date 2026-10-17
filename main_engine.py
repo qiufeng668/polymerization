@@ -8,7 +8,8 @@ import shutil
 import base64
 import hashlib
 import subprocess
-from urllib.parse import urlparse, unquote
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, unquote, quote, parse_qs
 import yaml
 
 # 路径配置
@@ -17,9 +18,16 @@ VAULT_DIR = "vault_repo"          # 私有库挂载目录
 STATE_FILE = os.path.join(VAULT_DIR, "cache_state.json")
 SANDBOX_DIR = "temp_sandbox"      # 脚本隔离运行沙盒
 PRE_TEST_FILE = "pre_test_nodes.txt"
-ALIVE_NODES_FILE = "alive_nodes.txt"
+
+# 连续失败多少次提示下架并清空旧缓存
+MAX_FAIL_STREAK = 3
 
 VALID_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "wg://")
+
+def get_beijing_time():
+    """获取北京时间字符串"""
+    tz_bj = timezone(timedelta(hours=8))
+    return datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_interval(py_path):
     """读取 py 文件前 5 行的 # @interval: 标记，返回秒数（默认 50m）"""
@@ -38,6 +46,11 @@ def parse_interval(py_path):
         print(f"⚠️ 读取 {py_path} 头部标签异常: {e}")
     return default_sec
 
+def format_interval(sec):
+    if sec % 86400 == 0: return f"{sec // 86400}天"
+    if sec % 3600 == 0: return f"{sec // 3600}小时"
+    return f"{sec // 60}分钟"
+
 def try_b64_decode(s):
     """尝试 Base64 解码"""
     s = s.strip()
@@ -50,6 +63,9 @@ def try_b64_decode(s):
         return base64.b64decode(s).decode('utf-8', errors='ignore')
     except Exception:
         return None
+
+def quote_safe(s):
+    return quote(s)
 
 def clash_proxy_to_uri(p):
     """将 Clash YAML 中的单个 proxy 字典转换为标准节点 URI 以便统一管理"""
@@ -96,10 +112,6 @@ def clash_proxy_to_uri(p):
         pass
     return None
 
-def quote_safe(s):
-    from urllib.parse import quote
-    return quote(s)
-
 def extract_nodes_from_text(content):
     """万用提取器：支持明文、Base64订阅、Clash YAML 混杂提取"""
     nodes = []
@@ -107,7 +119,6 @@ def extract_nodes_from_text(content):
     if not content:
         return nodes
 
-    # 1. 尝试作为 Clash YAML 解析
     if "proxies:" in content:
         try:
             data = yaml.safe_load(content)
@@ -119,18 +130,15 @@ def extract_nodes_from_text(content):
         except Exception:
             pass
 
-    # 2. 尝试整体 Base64 解码
     decoded = try_b64_decode(content)
     if decoded and any(scheme in decoded for scheme in VALID_SCHEMES):
         content = decoded
 
-    # 3. 逐行扫描提取标准协议链接
     for line in content.splitlines():
         line = line.strip()
         if line.startswith(VALID_SCHEMES):
             nodes.append(line)
         else:
-            # 兼容单行被 Base64 编码的情况
             sub_dec = try_b64_decode(line)
             if sub_dec:
                 for sub_line in sub_dec.splitlines():
@@ -153,8 +161,198 @@ def get_node_fingerprint(uri):
     except Exception:
         return hashlib.md5(uri.encode()).hexdigest()
 
+def extract_original_name(uri):
+    """提取节点的原始备注名称"""
+    try:
+        if uri.startswith("vmess://"):
+            b64 = uri[8:].split("#")[0].strip()
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            data = json.loads(base64.b64decode(b64).decode('utf-8', errors='ignore'))
+            ps = str(data.get("ps", "")).strip()
+            if ps:
+                return unquote(ps)
+        if "#" in uri:
+            return unquote(uri.split("#", 1)[1]).strip()
+    except Exception:
+        pass
+    return "未命名节点"
+
+def detect_region_flag(raw_name):
+    """根据原节点名称识别国家/地区国旗前缀"""
+    name = raw_name.upper()
+    if any(x in name for x in ["HK", "香港", "HONGKONG", "HONG KONG"]): return "🇭🇰 香港"
+    if any(x in name for x in ["TW", "台湾", "台灣", "TAIWAN", "TAIPEI", "TPE"]): return "🇹🇼 台湾"
+    if any(x in name for x in ["JP", "日本", "JAPAN", "TOKYO", "TYO", "OSAKA", "KIX", "NRT"]): return "🇯🇵 日本"
+    if any(x in name for x in ["SG", "新加坡", "SINGAPORE", "狮城", "SIN"]): return "🇸🇬 新加坡"
+    if any(x in name for x in ["US", "美国", "美國", "AMERICA", "UNITED STATES", "LAX", "SJC", "SEA", "NYC", "ORD"]): return "🇺🇸 美国"
+    if any(x in name for x in ["KR", "韩国", "韓國", "KOREA", "SEOUL", "ICN"]): return "🇰🇷 韩国"
+    if any(x in name for x in ["UK", "GB", "英国", "英國", "ENGLAND", "LONDON", "LHR"]): return "🇬🇧 英国"
+    if any(x in name for x in ["DE", "德国", "德國", "GERMANY", "FRA", "FRANKFURT"]): return "🇩🇪 德国"
+    if any(x in name for x in ["FR", "法国", "法國", "FRANCE", "PARIS", "CDG"]): return "🇫🇷 法国"
+    if any(x in name for x in ["CA", "加拿大", "CANADA", "YVR", "YYZ"]): return "🇨🇦 加拿大"
+    if any(x in name for x in ["AU", "澳大利亚", "澳洲", "AUSTRALIA", "SYD", "MEL"]): return "🇦🇺 澳大利亚"
+    if any(x in name for x in ["RU", "俄罗斯", "俄羅斯", "RUSSIA", "MOW"]): return "🇷🇺 俄罗斯"
+    if any(x in name for x in ["IN", "印度", "INDIA", "BOM"]): return "🇮🇳 印度"
+    if any(x in name for x in ["NL", "荷兰", "荷蘭", "NETHERLANDS", "AMS"]): return "🇳🇱 荷兰"
+    if any(x in name for x in ["TR", "土耳其", "TURKEY", "IST"]): return "🇹🇷 土耳其"
+    if any(x in name for x in ["TH", "泰国", "泰國", "THAILAND", "BKK"]): return "🇹🇭 泰国"
+    if any(x in name for x in ["VN", "越南", "VIETNAM", "SGN", "HAN"]): return "🇻🇳 越南"
+    if any(x in name for x in ["MY", "马来西亚", "馬來西亞", "MALAYSIA", "KUL"]): return "🇲🇾 马来西亚"
+    if any(x in name for x in ["PH", "菲律宾", "菲律賓", "PHILIPPINES", "MNL"]): return "🇵🇭 菲律宾"
+    if any(x in name for x in ["ID", "印尼", "印度尼西亚", "INDONESIA", "CGK"]): return "🇮🇩 印尼"
+    if any(x in name for x in ["BR", "巴西", "BRAZIL", "GRU"]): return "🇧🇷 巴西"
+    if any(x in name for x in ["ZA", "南非", "SOUTH AFRICA", "JNB"]): return "🇿🇦 南非"
+    return "🌐 其它"
+
+def apply_new_node_name(uri, new_name):
+    """将格式化后的新名称写回节点"""
+    try:
+        if uri.startswith("vmess://"):
+            b64 = uri[8:].split("#")[0].strip()
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            data = json.loads(base64.b64decode(b64).decode('utf-8', errors='ignore'))
+            data["ps"] = new_name
+            new_b64 = base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode('utf-8')).decode('utf-8')
+            return f"vmess://{new_b64}#{quote_safe(new_name)}"
+    except Exception:
+        pass
+    base_part = uri.split("#")[0]
+    return f"{base_part}#{quote_safe(new_name)}"
+
+def uri_to_clash_proxy(uri):
+    """将标准 URI 转换为支持 Mihomo/Clash.Meta 的 Proxy 字典 (支持 VLESS Reality / Hy2)"""
+    try:
+        name = extract_original_name(uri)
+        if uri.startswith("vmess://"):
+            b64 = uri[8:].split("#")[0].strip()
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            d = json.loads(base64.b64decode(b64).decode('utf-8', errors='ignore'))
+            proxy = {
+                "name": d.get("ps", name),
+                "type": "vmess",
+                "server": d.get("add"),
+                "port": int(d.get("port", 443)),
+                "uuid": d.get("id"),
+                "alterId": int(d.get("aid", 0)),
+                "cipher": d.get("scy", "auto"),
+                "udp": True,
+                "tls": d.get("tls") == "tls",
+                "skip-cert-verify": True,
+                "network": d.get("net", "tcp")
+            }
+            if d.get("sni"): proxy["servername"] = d.get("sni")
+            if proxy["network"] == "ws":
+                proxy["ws-opts"] = {"path": d.get("path", "/"), "headers": {"Host": d.get("host", d.get("add", ""))}}
+            return proxy
+
+        parsed = urlparse(uri)
+        scheme = parsed.scheme.lower()
+        server = parsed.hostname
+        port = parsed.port or 443
+        userinfo = unquote(parsed.username or "")
+        q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+        if scheme == "vless":
+            proxy = {
+                "name": name, "type": "vless", "server": server, "port": int(port),
+                "uuid": userinfo, "udp": True, "tls": q.get("security") in ("tls", "reality"),
+                "network": q.get("type", "tcp"), "skip-cert-verify": True
+            }
+            if q.get("flow"): proxy["flow"] = q["flow"]
+            if q.get("sni"): proxy["servername"] = q["sni"]
+            if q.get("fp"): proxy["client-fingerprint"] = q["fp"]
+            if q.get("security") == "reality":
+                proxy["reality-opts"] = {"public-key": q.get("pbk", ""), "short-id": q.get("sid", "")}
+            if proxy["network"] == "ws":
+                proxy["ws-opts"] = {"path": q.get("path", "/"), "headers": {"Host": q.get("host", q.get("sni", server))}}
+            elif proxy["network"] == "grpc":
+                proxy["grpc-opts"] = {"grpc-service-name": q.get("serviceName", "")}
+            return proxy
+
+        elif scheme in ("hysteria2", "hy2"):
+            proxy = {
+                "name": name, "type": "hysteria2", "server": server, "port": int(port),
+                "password": userinfo, "udp": True, "skip-cert-verify": True
+            }
+            if q.get("sni"): proxy["sni"] = q["sni"]
+            if q.get("obfs"):
+                proxy["obfs"] = q["obfs"]
+                if q.get("obfs-password"): proxy["obfs-password"] = q["obfs-password"]
+            return proxy
+
+        elif scheme == "trojan":
+            proxy = {
+                "name": name, "type": "trojan", "server": server, "port": int(port),
+                "password": userinfo, "udp": True, "skip-cert-verify": True
+            }
+            if q.get("sni"): proxy["sni"] = q["sni"]
+            if q.get("type") == "ws":
+                proxy["network"] = "ws"
+                proxy["ws-opts"] = {"path": q.get("path", "/"), "headers": {"Host": q.get("host", server)}}
+            return proxy
+
+        elif scheme == "ss":
+            if ":" not in userinfo:
+                dec = try_b64_decode(userinfo)
+                if dec: userinfo = dec
+            if ":" in userinfo:
+                cipher, pwd = userinfo.split(":", 1)
+                return {
+                    "name": name, "type": "ss", "server": server, "port": int(port),
+                    "cipher": cipher, "password": pwd, "udp": True
+                }
+    except Exception:
+        pass
+    return None
+
+def export_clash_yaml(final_nodes, out_path):
+    """原生生成支持 Mihomo / Clash.Meta 的 clash.yaml 配置文件"""
+    proxies = []
+    proxy_names = []
+    for uri in final_nodes:
+        p = uri_to_clash_proxy(uri)
+        if p and p.get("server") and p.get("port"):
+            proxies.append(p)
+            proxy_names.append(p["name"])
+
+    if not proxies:
+        return 0
+
+    clash_Wait = {
+        "mixed-port": 7890,
+        "allow-lan": True,
+        "mode": "rule",
+        "log-level": "info",
+        "unified-delay": True,
+        "tcp-concurrent": True,
+        "dns": {
+            "enable": True,
+            "ipv6": False,
+            "enhanced-mode": "fake-ip",
+            "nameserver": ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query"]
+        },
+        "proxies": proxies,
+        "proxy-groups": [
+            {"name": "🚀 节点选择", "type": "select", "proxies": ["⚡ 自动优选", "🔯 故障转移"] + proxy_names},
+            {"name": "⚡ 自动优选", "type": "url-test", " proxies": proxy_names, "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50},
+            {"name": "🔯 故障转移", "type": "fallback", "proxies": proxy_names, "url": "http://www.gstatic.com/generate_204", "interval": 300}
+        ],
+        "rules": [
+            "GEOIP,LAN,DIRECT,no-resolve",
+            "GEOIP,CN,DIRECT",
+            "MATCH,🚀 节点选择"
+        ]
+    }
+    # 修正键名空格
+    clash_Wait["proxy-groups"][1]["proxies"] = proxy_names
+    clash_Wait["proxy-groups"][1].pop(" proxies", None)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(clash_Wait, f, allow_unicode=True, sort_keys=False)
+    return len(proxies)
+
 def run_plugins_with_cache():
-    """核心分频调度器"""
+    """核心分频调度器 + 脚本失效监控"""
     os.makedirs(VAULT_DIR, exist_ok=True)
     state = {}
     if os.path.exists(STATE_FILE):
@@ -166,27 +364,33 @@ def run_plugins_with_cache():
 
     now = int(time.time())
     py_files = sorted(glob.glob(os.path.join(PLUGIN_DIR, "*.py")))
+    active_script_names = {os.path.basename(p) for p in py_files}
+
+    # 自动清理已经在 plugins 目录被你手动删除的脚本缓存记录
+    for old_key in list(state.keys()):
+        if old_key not in active_script_names:
+            del state[old_key]
+
     all_raw_nodes = []
+    plugin_reports = []
 
     print(f"📦 共扫描到 {len(py_files)} 个插件脚本")
 
     for py_path in py_files:
         script_name = os.path.basename(py_path)
         interval_sec = parse_interval(py_path)
-        last_run = state.get(script_name, {}).get("last_run", 0)
-        cached_nodes = state.get(script_name, {}).get("nodes", [])
+        info = state.get(script_name, {})
+        last_run = info.get("last_run", 0)
+        cached_nodes = info.get("nodes", [])
+        fail_count = info.get("fail_count", 0)
         elapsed = now - last_run
 
-        # 判断是否到达设定的冷却时间（预留 180 秒弹性窗口防止 Actions 轻微早到跳过）
         if elapsed + 180 >= interval_sec or not cached_nodes:
-            print(f"🚀 [执行] {script_name} (设定间隔: {interval_sec//60}m, 距上次: {elapsed//60}m)")
+            print(f"🚀 [执行] {script_name} (设定间隔: {format_interval(interval_sec)}, 历史连续失败: {fail_count}次)")
             
-            # 清理并重建沙盒目录
             if os.path.exists(SANDBOX_DIR):
                 shutil.rmtree(SANDBOX_DIR)
             os.makedirs(SANDBOX_DIR, exist_ok=True)
-            
-            # 将脚本复制进沙盒运行，这样它生成的任何文件都在沙盒里
             shutil.copy(py_path, os.path.join(SANDBOX_DIR, script_name))
             
             try:
@@ -195,15 +399,10 @@ def run_plugins_with_cache():
                     cwd=SANDBOX_DIR,
                     capture_output=False,
                     text=True,
-                    timeout=300 # 单个脚本最长允许跑 5 分钟
+                    timeout=300
                 )
                 
                 extracted = []
-                # 1. 抓取脚本打印到屏幕 (stdout) 的节点
-                if proc.stdout:
-                    extracted.extend(extract_nodes_from_text(proc.stdout))
-                
-                # 2. 自动嗅探脚本在目录里生成的所有结果文件
                 for root, _, files in os.walk(SANDBOX_DIR):
                     for file in files:
                         if file == script_name or file.endswith(".pyc"):
@@ -216,30 +415,144 @@ def run_plugins_with_cache():
                             pass
 
                 if extracted:
-                    print(f"   ✅ 成功从 {script_name} 提取到 {len(extracted)} 条节点，已更新缓存！")
-                    state[script_name] = {"last_run": now, "nodes": extracted}
+                    print(f"   ✅ 成功从 {script_name} 提取到 {len(extracted)} 条节点，已重置失败计数！")
+                    state[script_name] = {
+                        "last_run": now,
+                        "last_success": get_beijing_time(),
+                        "fail_count": 0,
+                        "nodes": extracted
+                    }
                     all_raw_nodes.extend(extracted)
+                    plugin_reports.append({
+                        "name": script_name,
+                        "interval": format_interval(interval_sec),
+                        "status": "✅ 正常更新",
+                        "count": len(extracted),
+                        "fail_count": 0,
+                        "advice": "运行良好"
+                    })
                 else:
-                    print(f"   ⚠️ {script_name} 本次未产出有效节点，沿用旧缓存 ({len(cached_nodes)} 条)")
-                    if proc.stderr:
-                        print(f"   [报错日志]: {proc.stderr[:300]}")
+                    fail_count += 1
+                    print(f"   ⚠️ {script_name} 本次未产出有效节点 (连续失败 {fail_count} 次)")
+                    if fail_count >= MAX_FAIL_STREAK:
+                        print(f"   🚨 [严重警告] {script_name} 已连续失败 {fail_count} 次，疑似失效！已清空其死节点缓存，建议下架删除！")
+                        cached_nodes = []
+                    state[script_name] = {
+                        "last_run": now,
+                        "last_success": info.get("last_success", "从未成功"),
+                        "fail_count": fail_count,
+                        "nodes": cached_nodes
+                    }
                     all_raw_nodes.extend(cached_nodes)
+                    plugin_reports.append({
+                        "name": script_name,
+                        "interval": format_interval(interval_sec),
+                        "status": "🚨 疑似失效" if fail_count >= MAX_FAIL_STREAK else "⚠️ 本次空载",
+                        "count": len(cached_nodes),
+                        "fail_count": fail_count,
+                        "advice": "🚨 建议下架删除！" if fail_count >= MAX_FAIL_STREAK else f"沿用旧缓存(失败{fail_count}次)"
+                    })
             except Exception as e:
-                print(f"   ❌ {script_name} 运行异常: {e}，沿用旧缓存")
+                fail_count += 1
+                print(f"   ❌ {script_name} 运行崩溃: {e} (连续失败 {fail_count} 次)")
+                if fail_count >= MAX_FAIL_STREAK:
+                    cached_nodes = []
+                state[script_name] = {
+                    "last_run": now,
+                    "last_success": info.get("last_success", "从未成功"),
+                    "fail_count": fail_count,
+                    "nodes": cached_nodes
+                }
                 all_raw_nodes.extend(cached_nodes)
+                plugin_reports.append({
+                    "name": script_name,
+                    "interval": format_interval(interval_sec),
+                    "status": "🚨 脚本崩溃" if fail_count >= MAX_FAIL_STREAK else "❌ 运行报错",
+                    "count": len(cached_nodes),
+                    "fail_count": fail_count,
+                    "advice": "🚨 建议下架删除！" if fail_count >= MAX_FAIL_STREAK else f"超时或报错(失败{fail_count}次)"
+                })
         else:
             remain_min = (interval_sec - elapsed) // 60
-            print(f"⏭️ [跳过] {script_name} 冷却中 (还需等待 {remain_min} 分钟)，直接读取缓存 ({len(cached_nodes)} 条)")
+            print(f"⏭️ [跳过] {script_name} 冷却中 (还需等待 {remain_min} 分钟)，读取缓存 ({len(cached_nodes)} 条)")
             all_raw_nodes.extend(cached_nodes)
+            plugin_reports.append({
+                "name": script_name,
+                "interval": format_interval(interval_sec),
+                "status": f"⏭️ 冷却中({remain_min}m)",
+                "count": len(cached_nodes),
+                "fail_count": fail_count,
+                "advice": "🚨 建议下架删除！" if fail_count >= MAX_FAIL_STREAK else "读取历史缓存"
+            })
 
-    # 保存更新后的状态与缓存池回私有库目录
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-    return all_raw_nodes
+    return all_raw_nodes, plugin_reports
 
-def deduplicate_and_speedtest(raw_nodes):
-    """指纹去重 + 调用内核进行真连接测速 + 导出成品"""
+def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region_counters, plugin_reports):
+    """生成可视化统计看板（同时写入私有库 README.md 与 GitHub Actions Summary）"""
+    dead_scripts = [p["name"] for p in plugin_reports if p["fail_count"] >= MAX_FAIL_STREAK]
+    
+    lines = [
+        "# 🚀 节点聚合中心 - 实时健康看板",
+        f"> **最后更新时间（北京时间）**：`{get_beijing_time()}`\n",
+        "## 📊 核心数据汇总",
+        "| 统计指标 | 数量 | 说明 |",
+        "| :--- | :--- | :--- |",
+        f"| **📥 原始抓取总数** | `{raw_count} 条` | 所有脚本产出的未去重总和 |",
+        f"| **🔍 指纹深度去重** | `{unique_count} 条` | 剔除不同源重复节点后的数量 |",
+        f"| **🎯 真连接测速存活** | **`{alive_count} 条`** | 最终写入 `nodes_plain.txt` 与 `sub_base64.txt` |",
+        f"| **⚔️ Clash 转换成功** | **`{clash_count} 条`** | 最终写入 `clash.yaml` (支持 VLESS Reality / Hy2) |",
+        ""
+    ]
+
+    if dead_scripts:
+        lines.append("## 🚨 失效脚本下架提醒（重点关注！）")
+        lines.append(f"⚠️ 检测到以下 **{len(dead_scripts)}** 个脚本已连续失败满 {MAX_FAIL_STREAK} 次，系统已自动清空其旧缓存，请前往公开库 `plugins/` 目录检查或删除：")
+        for ds in dead_scripts:
+            lines.append(f"- ❌ **`plugins/{ds}`** *(建议删除)*")
+        lines.append("")
+
+    lines.append("## 🧩 插件脚本健康度明细")
+    lines.append("| 脚本名称 | 设定周期 | 当前状态 | 贡献节点数 | 连续失败 | 诊断建议 |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+    for p in plugin_reports:
+        lines.append(f"| `{p['name']}` | {p['interval']} | {p['status']} | **{p['count']}** 条 | {p['fail_count']} 次 | {p['advice']} |")
+    lines.append("")
+
+    if region_counters:
+        lines.append("## 🌍 存活节点地区分布")
+        region_str = " 、 ".join([f"**{k}**: `{v}条`" for k, v in sorted(region_counters.items(), key=lambda x: x[1], reverse=True)])
+        lines.append(region_str)
+        lines.append("")
+
+    report_md = "\n".join(lines)
+
+    # 1. 写入私有库 README.md，打开私有库主页直接可见
+    with open(os.path.join(VAULT_DIR, "README.md"), "w", encoding="utf-8") as f:
+        f.write(report_md)
+
+    # 2. 写入 GitHub Actions 官方 Summary 面板
+    summary_env = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_env:
+        try:
+            with open(summary_env, "a", encoding="utf-8") as f:
+                f.write(report_md + "\n")
+        except Exception:
+            pass
+
+    # 3. 在控制台打印精简尾声汇总
+    print("\n" + "=" * 60)
+    print(f"📊 【本次聚合战报】 原始:{raw_count} -> 去重:{unique_count} -> 测速存活:{alive_count} -> Clash:{clash_count}")
+    if dead_scripts:
+        print(f"🚨 【下架警告】 以下脚本已连续失效，建议从 plugins/ 中删除: {', '.join(dead_scripts)}")
+    else:
+        print("✅ 【脚本健康】 所有启用中的脚本状态均正常！")
+    print("=" * 60 + "\n")
+
+def deduplicate_and_speedtest(raw_nodes, plugin_reports):
+    """指纹去重 + 调用内核进行真连接测速 + 导出成品与看板"""
     unique_map = {}
     for uri in raw_nodes:
         fp = get_node_fingerprint(uri)
@@ -251,24 +564,24 @@ def deduplicate_and_speedtest(raw_nodes):
 
     if not unique_nodes:
         print("⚠️ 没有任何可用节点，终止导出。")
+        generate_dashboard(len(raw_nodes), 0, 0, 0, {}, plugin_reports)
         return
 
     with open(PRE_TEST_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(unique_nodes))
 
-    # 调用 Actions 中预装的 LiteSpeedTest 进行真连接测速
     alive_nodes = []
     if os.path.exists("./lite"):
         print("⚡ 启动内核级真连接测速 (Testing real HTTP latency via proxy)...")
         lite_conf = {
             "group": "MyAggregator",
-            "speedtestMode": "pingonly", # 仅测试真连接延迟(generate_204)，不跑大流量下载以防耗尽节点流量
+            "speedtestMode": "pingonly",
             "pingMethod": "googleping",
             "sortMethod": "rspeed",
-            "concurrency": 64,
+            "concurrency": 16,
             "testMode": 2,
             "subscription": PRE_TEST_FILE,
-            "timeout": 8,
+            "timeout": 10,
             "language": "en",
             "unique": True,
             "outputMode": 0
@@ -277,8 +590,7 @@ def deduplicate_and_speedtest(raw_nodes):
             json.dump(lite_conf, f)
 
         try:
-            subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=600)
-            # 读取测速存活结果
+            subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=720)
             if os.path.exists("output.txt"):
                 with open("output.txt", "r", encoding="utf-8", errors="ignore") as f:
                     alive_nodes = extract_nodes_from_text(f.read())
@@ -291,18 +603,19 @@ def deduplicate_and_speedtest(raw_nodes):
     else:
         print(f"🎯 真连接测速完成！存活真节点: {len(alive_nodes)} / {len(unique_nodes)} 条")
 
-    # 保留原节点名称打标
+    # 智能归类国家国旗 + 保留原节点备注
+    region_counters = {}
     final_nodes = []
-    for idx, uri in enumerate(alive_nodes, 1):
-        parts = uri.split("#")
-        base_part = parts[0]
-        # 提取原名，如果没有原名则用序号保底
-        original_name = unquote(parts[1]) if len(parts) > 1 else f"节点_{idx:03d}"
-        # 在原名称前加个闪电符号以示区分，保留国家地区信息
-        tag = quote_safe(f"⚡ {original_name}")
-        final_nodes.append(f"{base_part}#{tag}")
+    for uri in alive_nodes:
+        orig_name = extract_original_name(uri)
+        region_flag = detect_region_flag(orig_name)
+        region_counters[region_flag] = region_counters.get(region_flag, 0) + 1
+        seq = region_counters[region_flag]
+        
+        new_label = f"{region_flag} {seq:02d} | {orig_name}"
+        final_nodes.append(apply_new_node_name(uri, new_label))
 
-    # 导出 1：明文列表 (nodes.txt)
+    # 导出 1：明文列表 (nodes_plain.txt)
     with open(os.path.join(VAULT_DIR, "nodes_plain.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(final_nodes))
 
@@ -311,8 +624,12 @@ def deduplicate_and_speedtest(raw_nodes):
     with open(os.path.join(VAULT_DIR, "sub_base64.txt"), "w", encoding="utf-8") as f:
         f.write(b64_str)
 
-    print("🎉 导出文件已成功写入私有库缓存区！")
+    # 导出 3：原生生成 Clash Meta 配置文件 (clash.yaml)
+    clash_count = export_clash_yaml(final_nodes, os.path.join(VAULT_DIR, "clash.yaml"))
+
+    # 生成可视化监控看板
+    generate_dashboard(len(raw_nodes), len(unique_nodes), len(final_nodes), clash_count, region_counters, plugin_reports)
 
 if __name__ == "__main__":
-    raw = run_plugins_with_cache()
-    deduplicate_and_speedtest(raw)
+    raw, reports = run_plugins_with_cache()
+    deduplicate_and_speedtest(raw, reports)
