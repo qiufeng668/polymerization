@@ -20,6 +20,8 @@ SANDBOX_DIR = "temp_sandbox"
 PRE_TEST_FILE = "pre_test_nodes.txt"
 
 MAX_FAIL_STREAK = 3
+# 测速存活延迟阈值（毫秒）：超过此值的节点判为大卡/不可用剔除。有 ping 值才判定；lost=0 但未报 ping 的不误杀。
+MAX_LATENCY_MS = 1000
 VALID_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "wg://")
 
 PLUGIN_TAGS = {
@@ -610,17 +612,31 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
                         except: lost = 100.0
                         ping_val = data.get("ping")
                         if isinstance(ping_val, (int, float)):
-                            uniq_map[i] = ping_val          # 有延迟，记录
+                            # 有明确延迟：超过阈值(默认1000ms)则判定为大卡/死节点，剔除
+                            if ping_val <= MAX_LATENCY_MS:
+                                uniq_map[i] = ping_val
+                            # else: 延迟 > 阈值，丢弃（不加入存活）
                         elif lost < 100:
                             uniq_map.setdefault(i, 999999)  # 连通但未报 ping，也算存活（大延迟占位）
                     except Exception:
                         pass
 
-            # 按延迟从低到高（占位的排后面），但都算存活
-            valid_ids = [idx for idx, _ in sorted(uniq_map.items(), key=lambda kv: kv[1])]
-            print(f"✅ 存活节点 {len(valid_ids)} 个（含 lost=0 无 ping 的连通节点）")
+            # 静态 IP 节点优先：ip 直连比动态域名(vip/3dns等)稳；再按延迟低→高
+            _STATIC_RE = __import__("re").compile(r"^\d+\.\d+\.\d+\.\d+$")
+            def _rank(idx):
+                uri = unique_nodes[idx] if 0 <= idx < len(unique_nodes) else ""
+                host = ""
+                if "://" in uri:
+                    try:
+                        host = uri.split("//", 1)[1].split("@", 1)[-1].split(":", 1)[0]
+                    except Exception:
+                        host = ""
+                is_ip = bool(_STATIC_RE.match(host))  # 纯 IPv4 = 静态，优先
+                return (0 if is_ip else 1, uniq_map.get(idx, 999999))
+            valid_ids = sorted(uniq_map.keys(), key=_rank)
+            print(f"✅ 存活节点 {len(valid_ids)} 个（阈值≤{MAX_LATENCY_MS}ms + 静态IP优先）")
 
-            for idx in sorted(valid_ids):
+            for idx in valid_ids:
                 if 0 <= idx < len(unique_nodes):
                     alive_nodes.append(unique_nodes[idx])
 
