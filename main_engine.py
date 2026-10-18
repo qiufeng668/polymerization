@@ -581,23 +581,23 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
         with open("lite_config.json", "w", encoding="utf-8") as f: json.dump(lite_conf, f)
 
         try:
+            if os.path.exists("out.json"): os.remove("out.json")
             subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=720)
             
-            if os.path.exists("output.txt"):
+            if os.path.exists("out.json"):
                 try:
-                    content = open("output.txt", "r", encoding="utf-8", errors="ignore").read().strip()
-                    if content.startswith("{"):
-                        data = json.loads(content)
-                        for node in data.get("nodes", []):
-                            ping_str = str(node.get("ping", "0")).replace("ms", "").strip()
-                            if float(ping_str) > 0:
-                                if link := node.get("link", ""): alive_nodes.append(link)
-                    else:
-                        for uri in extract_nodes_from_text(content):
-                            if not any(bad in extract_original_name(uri).upper() for bad in ("TIMEOUT", "FAIL", "ERROR", "N/A")):
-                                alive_nodes.append(uri)
-                except Exception as e: print(f"⚠️ 测速解析异常: {e}")
-        except Exception as e: print(f"⚠️ 测速组件运行超时: {e}")
+                    with open("out.json", "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    for node in data.get("nodes", []):
+                        ping_str = str(node.get("ping", "0")).replace("ms", "").strip()
+                        if float(ping_str) > 0:
+                            if link := node.get("link", ""): alive_nodes.append(link)
+                except Exception as e: 
+                    print(f"⚠️ 测速解析异常: {e}")
+            else:
+                print("⚠️ 测速组件未生成 out.json 文件！")
+        except Exception as e: 
+            print(f"⚠️ 测速组件运行超时: {e}")
 
     if not alive_nodes:
         print("ℹ️ 测速过滤后无节点存活，将降级使用去重列表保底...")
