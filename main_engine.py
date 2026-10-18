@@ -440,6 +440,11 @@ def run_plugins_with_cache():
             with open(STATE_FILE, "r", encoding="utf-8") as f: state = json.load(f)
         except Exception: pass
 
+    # 手动运行时强制全量重跑：由 workflow 传入 MANUAL_RUN=true（github.event_name == workflow_dispatch）
+    manual_force = os.environ.get("MANUAL_RUN", "").strip().lower() in ("1", "true", "yes")
+    if manual_force:
+        print("🟢 [手动模式] 强制刷新所有插件（绕过 @interval 冷却）")
+
     now = int(time.time())
     py_files = sorted(glob.glob(os.path.join(PLUGIN_DIR, "*.py")))
     active_script_names = {os.path.basename(p) for p in py_files}
@@ -466,7 +471,7 @@ def run_plugins_with_cache():
         fail_count = info.get("fail_count", 0)
         elapsed = now - last_run
 
-        if elapsed + 180 >= interval_sec or not cached_nodes:
+        if manual_force or elapsed + 180 >= interval_sec or not cached_nodes:
             print(f"🚀 [执行] {script_name} (设定间隔: {format_interval(interval_sec)}, 历史连续失败: {fail_count}次)")
             if os.path.exists(SANDBOX_DIR): shutil.rmtree(SANDBOX_DIR)
             os.makedirs(SANDBOX_DIR, exist_ok=True)
@@ -573,40 +578,53 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
 
     alive_nodes = []
     if os.path.exists("./lite"):
-        print("⚡ 启动内核级真连接测速 (Testing real HTTP latency via proxy)...")
-        # 🚨 拯救被墙节点的改动：使用 tcping（仅验证端口开启）避免 GitHub IP 被屏蔽造成的误杀！
+        print("⚡ 启动内核级真连接测速 (通过 Cloudflare generate_204 验证真实转发)...")
+        # 用 googleping：lite 内部走 https://cp.cloudflare.com/generate_204 测【真实代理转发】，
+        # 而不是 tcping（只测端口开，会把"端口开但代理已失效"的假活节点混进来）。
+        # 实测发现：lite 的 gotping id 从 0 开始，且存活节点多数只有 lost=0% 但没有 ping 数值。
+        # 因此存活判定改用 lost < 100%（凡丢包率不足 100% 即视为连通可用），而不是只看 ping>0。
         lite_conf = {
-            "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "tcping",
-            "sortMethod": "rspeed", "concurrency": 64, "testMode": 2,
-            "subscription": PRE_TEST_FILE, "timeout": 8, "language": "en",
-            "unique": True, "outputMode": 0
+            "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "googleping",
+            "sortMethod": "rspeed", "concurrency": 10, "testMode": 2,
+            "subscription": PRE_TEST_FILE, "timeout": 3, "language": "en",
+            "unique": True, "outputMode": 0,
+            "url": "https://cp.cloudflare.com/generate_204"
         }
         with open("lite_config.json", "w", encoding="utf-8") as f: json.dump(lite_conf, f)
 
         try:
             proc = subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], capture_output=True, text=True, timeout=720)
-            stdout_log = proc.stdout
+            # lite 把 gotping 进度写到 stderr（不是 stdout），必须两个都扫，否则解析不到任何存活
+            stdout_log = (proc.stdout or "") + (proc.stderr or "")
 
-            valid_ids = set()
+            # 存每个存活 id -> 延迟（用于排序；没延迟的 lost=0 也算连通）
+            uniq_map = {}
             for line in stdout_log.splitlines():
                 if '"info":"gotping"' in line and "{" in line:
                     try:
-                        json_str = line[line.find("{"):]
-                        data = json.loads(json_str)
-                        ping_val = float(str(data.get("ping", 0)).replace("ms", ""))
-                        if ping_val > 0:
-                            # 🚨 猪脑子错位 Bug 修复处：测速软件给的 ID 是从 1 开始的，减去 1 才能正确对应 Python 的 0 索引！
-                            valid_ids.add(int(data["id"]) - 1)
+                        s = line[line.find("{"):]
+                        data = json.loads(s)
+                        i = int(data["id"])            # lite id 从 0 开始，直接对齐，绝不 -1
+                        lost_str = str(data.get("lost", "100%")).replace("%", "")
+                        try: lost = float(lost_str)
+                        except: lost = 100.0
+                        ping_val = data.get("ping")
+                        if isinstance(ping_val, (int, float)):
+                            uniq_map[i] = ping_val          # 有延迟，记录
+                        elif lost < 100:
+                            uniq_map.setdefault(i, 999999)  # 连通但未报 ping，也算存活（大延迟占位）
                     except Exception:
                         pass
-            
-            print(f"✅ 成功从控制台解析到 {len(valid_ids)} 个存活节点 ID！")
-            
-            for idx in sorted(list(valid_ids)):
+
+            # 按延迟从低到高（占位的排后面），但都算存活
+            valid_ids = [idx for idx, _ in sorted(uniq_map.items(), key=lambda kv: kv[1])]
+            print(f"✅ 存活节点 {len(valid_ids)} 个（含 lost=0 无 ping 的连通节点）")
+
+            for idx in sorted(valid_ids):
                 if 0 <= idx < len(unique_nodes):
                     alive_nodes.append(unique_nodes[idx])
-                    
-        except Exception as e: 
+
+        except Exception as e:
             print(f"⚠️ 测速组件运行或解析异常: {e}")
 
     if not alive_nodes:
