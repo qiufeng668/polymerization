@@ -1,4 +1,4 @@
-# @interval: 2d
+# @interval: 1d
 #!/usr/bin/env python3
 import re
 """DeVPN 一键拉节点（单文件，拷走即可跑）
