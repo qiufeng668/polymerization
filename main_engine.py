@@ -223,7 +223,7 @@ DETECT_CITY = sorted([
     ("东京", "🇯🇵 东京"), ("大阪", "🇯🇵 大阪"), ("名古屋", "🇯🇵 名古屋"), ("札幌", "🇯🇵 札幌"),
     ("福冈", "🇯🇵 福冈"), ("横滨", "🇯🇵 横滨"), ("埼玉", "🇯🇵 埼玉"), ("TOKYO", "🇯🇵 东京"),
     ("OSAKA", "🇯🇵 大阪"), ("NAGOYA", "🇯🇵 名古屋"), ("NRT", "🇯🇵 东京"), ("KIX", "🇯🇵 大阪"), ("TYO", "🇯🇵 东京"),
-    ("首尔", "🇰🇷 首尔"), ("釜山", "🇰🇷釜山"), ("仁川", "🇰🇷 仁川"), ("SEOUL", "🇰🇷 首尔"), ("ICN", "🇰🇷 首尔"),
+    ("首尔", "🇰🇷 首尔"), ("釜山", "🇰🇷 釜山"), ("仁川", "🇰🇷 仁川"), ("SEOUL", "🇰🇷 首尔"), ("ICN", "🇰🇷 首尔"),
     ("台北", "🇹🇼 台北"), ("新北", "🇹🇼 新北"), ("高雄", "🇹🇼 高雄"), ("台中", "🇹🇼 台中"), ("TAIPEI", "🇹🇼 台北"), ("TPE", "🇹🇼 台北"),
     ("新加坡", "🇸🇬 新加坡"), ("狮城", "🇸🇬 新加坡"), ("SINGAPORE", "🇸🇬 新加坡"), ("SIN", "🇸🇬 新加坡"),
     ("雅加达", "🇮🇩 雅加达"), ("JAKARTA", "🇮🇩 雅加达"), ("CGK", "🇮🇩 雅加达"),
@@ -288,13 +288,15 @@ DETECT_CC_BY_CODE = {
 }
 
 def apply_new_node_name(uri, new_name):
+    # 🚨 痛定思痛的修复：VMess 协议不支持尾部加 # 号！否则代理软件直接崩溃报 Invalid base64
     try:
         if uri.startswith("vmess://"):
             b64 = uri[8:].split("#")[0].strip()
             b64 += "=" * ((4 - len(b64) % 4) % 4)
             data = json.loads(base64.b64decode(b64).decode('utf-8', errors='ignore'))
             data["ps"] = new_name
-            return f"vmess://{base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).decode('utf-8')}#{quote_safe(new_name)}"
+            # VMess 名字只藏在 json 里，不拼接在结尾！
+            return f"vmess://{base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).decode('utf-8')}"
     except Exception: pass
     return f"{uri.split('#')[0]}#{quote_safe(new_name)}"
 
@@ -572,48 +574,38 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     alive_nodes = []
     if os.path.exists("./lite"):
         print("⚡ 启动内核级真连接测速 (Testing real HTTP latency via proxy)...")
+        # 🚨 拯救被墙节点的改动：使用 tcping（仅验证端口开启）避免 GitHub IP 被屏蔽造成的误杀！
         lite_conf = {
-            "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "googleping",
-            "sortMethod": "rspeed", "concurrency": 32, "testMode": 2,
-            "subscription": PRE_TEST_FILE, "timeout": 5, "language": "en",
+            "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "tcping",
+            "sortMethod": "rspeed", "concurrency": 64, "testMode": 2,
+            "subscription": PRE_TEST_FILE, "timeout": 8, "language": "en",
             "unique": True, "outputMode": 0
         }
         with open("lite_config.json", "w", encoding="utf-8") as f: json.dump(lite_conf, f)
 
         try:
-            # 🎯 终极杀招：把所有控制台输出强行写入 lite_out.log，避开 Python 管道缓存丢失的问题
-            with open("lite_out.log", "w", encoding="utf-8") as out_f:
-                subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], stdout=out_f, stderr=subprocess.STDOUT, timeout=720)
-            
-            if os.path.exists("lite_out.log"):
-                with open("lite_out.log", "r", encoding="utf-8", errors="ignore") as f:
-                    log_content = f.read()
-                
-                if len(log_content) > 4000:
-                    print(log_content[:2000] + "\n...[输出过长已折叠]...\n" + log_content[-2000:])
-                else:
-                    print(log_content)
+            proc = subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], capture_output=True, text=True, timeout=720)
+            stdout_log = proc.stdout
 
-                valid_ids = set()
-                for line in log_content.splitlines():
-                    if '"info":"gotping"' in line and "{" in line:
-                        try:
-                            json_str = line[line.find("{"):]
-                            data = json.loads(json_str)
-                            ping_val = float(str(data.get("ping", 0)).replace("ms", ""))
-                            # 🎯 只有真正连通并且延迟大于 0 的节点才能活下来！
-                            if ping_val > 0:
-                                valid_ids.add(int(data["id"]))
-                        except Exception:
-                            pass
-                
-                print(f"✅ 成功从控制台解析到 {len(valid_ids)} 个存活节点 ID！")
-                
-                for idx in sorted(list(valid_ids)):
-                    if 0 <= idx < len(unique_nodes):
-                        alive_nodes.append(unique_nodes[idx])
-            else:
-                print("⚠️ 未找到 lite_out.log 日志文件！")
+            valid_ids = set()
+            for line in stdout_log.splitlines():
+                if '"info":"gotping"' in line and "{" in line:
+                    try:
+                        json_str = line[line.find("{"):]
+                        data = json.loads(json_str)
+                        ping_val = float(str(data.get("ping", 0)).replace("ms", ""))
+                        if ping_val > 0:
+                            # 🚨 猪脑子错位 Bug 修复处：测速软件给的 ID 是从 1 开始的，减去 1 才能正确对应 Python 的 0 索引！
+                            valid_ids.add(int(data["id"]) - 1)
+                    except Exception:
+                        pass
+            
+            print(f"✅ 成功从控制台解析到 {len(valid_ids)} 个存活节点 ID！")
+            
+            for idx in sorted(list(valid_ids)):
+                if 0 <= idx < len(unique_nodes):
+                    alive_nodes.append(unique_nodes[idx])
+                    
         except Exception as e: 
             print(f"⚠️ 测速组件运行或解析异常: {e}")
 
