@@ -1,4 +1,4 @@
-# @interval: 1d
+# @interval: 12h
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
