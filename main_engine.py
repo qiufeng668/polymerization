@@ -572,36 +572,42 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     alive_nodes = []
     if os.path.exists("./lite"):
         print("⚡ 启动内核级真连接测速 (Testing real HTTP latency via proxy)...")
-        # 🔑 核心修复：testMode 设为 0 (正常模式)，outputMode 设为 1 (强制生成 out.json)
+        # 🔑 核心策略：testMode=2，强制内核在控制台打印 JSON 格式测速结果
         lite_conf = {
             "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "googleping",
-            "sortMethod": "rspeed", "concurrency": 32, "testMode": 0,
+            "sortMethod": "rspeed", "concurrency": 32, "testMode": 2,
             "subscription": PRE_TEST_FILE, "timeout": 5, "language": "en",
-            "unique": True, "outputMode": 1
+            "unique": True, "outputMode": 0
         }
         with open("lite_config.json", "w", encoding="utf-8") as f: json.dump(lite_conf, f)
 
         try:
-            if os.path.exists("out.json"): os.remove("out.json")
-            # 正常运行，不再隐藏控制台输出
-            subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=720)
+            # 💡 终极修复方案：拦截控制台输出，直接解析打印出来的实时日志
+            proc = subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], capture_output=True, text=True, timeout=720)
+            stdout_log = proc.stdout
             
-            # 读取内核原生生成的 JSON 文件
-            if os.path.exists("out.json"):
-                try:
-                    with open("out.json", "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    for node in data.get("nodes", []):
-                        ping_str = str(node.get("ping", "0")).replace("ms", "").strip()
-                        # 🎯 物理过滤：严格要求 Ping 大于 0，否则直接丢弃！
-                        if float(ping_str) > 0:
-                            if link := node.get("link", ""): alive_nodes.append(link)
-                except Exception as e: 
-                    print(f"⚠️ out.json 解析异常: {e}")
-            else:
-                print("⚠️ 测速组件未生成 out.json 文件，测速内核异常！")
+            print(stdout_log)
+
+            valid_ids = set()
+            for line in stdout_log.splitlines():
+                if '"info":"gotping"' in line and "{" in line:
+                    try:
+                        json_str = line[line.find("{"):]
+                        data = json.loads(json_str)
+                        ping_val = float(str(data.get("ping", 0)).replace("ms", ""))
+                        if ping_val > 0:
+                            valid_ids.add(int(data["id"]))
+                    except Exception:
+                        pass
+            
+            print(f"✅ 成功从控制台解析到 {len(valid_ids)} 个存活节点 ID！")
+            
+            for idx in sorted(list(valid_ids)):
+                if 0 <= idx < len(unique_nodes):
+                    alive_nodes.append(unique_nodes[idx])
+                    
         except Exception as e: 
-            print(f"⚠️ 测速组件运行超时或异常: {e}")
+            print(f"⚠️ 测速组件运行或解析异常: {e}")
 
     if not alive_nodes:
         print("ℹ️ 测速过滤后无节点存活，将降级使用去重列表保底...")
