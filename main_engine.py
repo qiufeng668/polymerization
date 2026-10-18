@@ -581,29 +581,42 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
         with open("lite_config.json", "w", encoding="utf-8") as f: json.dump(lite_conf, f)
 
         try:
-            if os.path.exists("out.json"): os.remove("out.json")
-            subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=720)
+            # 核心杀招：拦截标准输出！完全不依赖 out.json 实体文件！
+            proc = subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], capture_output=True, text=True, timeout=720)
+            stdout_log = proc.stdout
             
-            if os.path.exists("out.json"):
-                try:
-                    with open("out.json", "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    for node in data.get("nodes", []):
-                        ping_str = str(node.get("ping", "0")).replace("ms", "").strip()
-                        if float(ping_str) > 0:
-                            if link := node.get("link", ""): alive_nodes.append(link)
-                except Exception as e: 
-                    print(f"⚠️ 测速解析异常: {e}")
+            # 为了防止日志过长导致 Actions 崩溃，仅截取打印部分给网页端看
+            if len(stdout_log) > 4000:
+                print(stdout_log[:2000] + "\n...[输出过长已折叠]...\n" + stdout_log[-2000:])
             else:
-                print("⚠️ 测速组件未生成 out.json 文件！")
+                print(stdout_log)
+
+            valid_ids = set()
+            for line in stdout_log.splitlines():
+                # 精确捕捉日志里打印的 {"id":16,"info":"gotping","ping":191...} 格式
+                if "{" in line and "gotping" in line:
+                    try:
+                        json_str = line[line.find("{"):]
+                        data = json.loads(json_str)
+                        # 【核心过滤】实测 ping 大于 0 才允许存活！
+                        if data.get("ping", 0) > 0:
+                            valid_ids.add(data.get("id"))
+                    except Exception:
+                        pass
+            
+            # 根据提取出的健康节点 ID 映射回真实订阅链接
+            for idx in sorted(valid_ids):
+                if 0 <= idx < len(unique_nodes):
+                    alive_nodes.append(unique_nodes[idx])
+            
         except Exception as e: 
-            print(f"⚠️ 测速组件运行超时: {e}")
+            print(f"⚠️ 测速组件运行异常: {e}")
 
     if not alive_nodes:
         print("ℹ️ 测速过滤后无节点存活，将降级使用去重列表保底...")
         alive_nodes = unique_nodes
     else:
-        print(f"🎯 真连接测速完成！剔除死节点后存活: {len(alive_nodes)} / {len(unique_nodes)} 条")
+        print(f"🎯 真连接测速完成！精准拦截死节点，存活真节点: {len(alive_nodes)} / {len(unique_nodes)} 条")
 
     region_counters, final_nodes = {}, []
     for uri in alive_nodes:
