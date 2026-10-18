@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# @interval: 12h
+# @interval: 50m
 """iPoW.ai 全自动实时真实节点拉取工具 (官方 v4.3.9 最新架构专用版)
 
 【核心设计原则：100% 动态实时获取，零冗余死代码】
