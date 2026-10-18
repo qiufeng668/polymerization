@@ -86,7 +86,7 @@
 - Surfer（SF来源）命名正常：`🇭🇰 香港 01 | SF香港`
 - 菜鸟接口风控空载，但引擎会失败计数，不致命
 
-### 交付文件（AI文件夹/poly_improved/）
+### 交付文件（文件夹/poly_improved/）
 - `main_engine.py`（六条改进 + 命名 + SF支持）
 - `plugins/` 全部 10 个插件（7原 + Surfer + __ + 替换后的 ipow）
 - `requirements.txt`
@@ -115,7 +115,7 @@
 - 10插件全调度（含菜鸟 38 条，接口已恢复）→ 579 汇总 → 去重 424 → 死节点剔20 → **测速筛出 406 存活** → Clash 406
 - 脚本全健康，exit=0，auto/manual 双模式验证通过。
 
-### 交付（AI文件夹/poly_improved/）
+### 交付（文件夹/poly_improved/）
 - `main_engine.py`：含两处修复 + 手动强制（三处 mdd5 一致）
 - `.github/workflows/run.yml`：含 MANUAL_RUN（三处 mdd5 一致）
 - `plugins/`：10 个插件以你最新仓库为准（de/lanmao/sulian/银狐 为 1d，其余 12h；无 fengniao 残留）
