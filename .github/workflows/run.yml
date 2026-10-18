@@ -37,6 +37,8 @@ jobs:
       - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
         env:
           PYTHONUNBUFFERED: "1"
+          # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
+          MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
         run: |
           python -u main_engine.py
 
