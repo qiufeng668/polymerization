@@ -2,3 +2,6 @@ requests
 pyyaml
 urllib3
 pycryptodome
+cryptography
+eth-account
+pynacl
