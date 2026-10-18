@@ -279,13 +279,12 @@ DETECT_CC_BY_CODE = {
     "FR": "🇫🇷 法国", "CA": "🇨🇦 加拿大", "AU": "🇦🇺 澳大利亚", "RU": "🇷🇺 俄罗斯",
     "IN": "🇮🇳 印度", "NL": "🇳🇱 荷兰", "TR": "🇹🇷 土耳其", "TH": "🇹🇭 泰国",
     "VN": "🇻🇳 越南", "MY": "🇲🇾 马来西亚", "PH": "🇵🇭 菲律宾", "ID": "🇮🇩 印尼",
-    "BR": "🇧🇷 巴西", "ZA", "🇿🇦 南非", "NZ": "🇳🇿 新西兰", "IT": "🇮🇹 意大利",
+    "BR": "🇧🇷 巴西", "ZA": "🇿🇦 南非", "NZ": "🇳🇿 新西兰", "IT": "🇮🇹 意大利",
     "ES": "🇪🇸 西班牙", "CH": "🇨🇭 瑞士", "SE": "🇸🇪 瑞典", "PL": "🇵🇱 波兰",
     "AE": "🇦🇪 阿联酋", "EG": "🇪🇬 埃及", "AR": "🇦🇷 阿根廷", "CL": "🇨🇱 智利",
     "MX": "🇲🇽 墨西哥", "BE": "🇧🇪 比利时", "AT": "🇦🇹 奥地利", "DK": "🇩🇰 丹麦",
     "FI": "🇫🇮 芬兰", "NO": "🇳🇴 挪威", "CZ": "🇨🇿 捷克", "HU": "🇭🇺 匈牙利",
-    "PT": "🇵🇹 葡萄牙", "RO": "🇷🇴 罗马尼亚", "UA": "🇺🇦 乌克兰", "SA": "🇸🇦 沙特",
-    "IL": "🇮🇱 以色列", "QA": "🇶🇦 卡塔尔", "PK": "🇵🇰 巴基斯坦", "BD": "🇧🇩 孟加拉国"
+    "PT": "🇵🇹 葡萄牙", "RO": "🇷🇴 罗马尼亚", "UA": "🇺🇦 乌克兰", "SA": "🇸🇦 沙特"
 }
 
 def apply_new_node_name(uri, new_name):
@@ -573,7 +572,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     alive_nodes = []
     if os.path.exists("./lite"):
         print("⚡ 启动内核级真连接测速 (Testing real HTTP latency via proxy)...")
-        # 强制配置 LiteSpeedTest 输出 JSON 格式，设定极限超时为 5 秒，剔除一切高延迟
         lite_conf = {
             "group": "MyAggregator", "speedtestMode": "pingonly", "pingMethod": "googleping",
             "sortMethod": "rspeed", "concurrency": 32, "testMode": 2,
@@ -585,7 +583,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
         try:
             subprocess.run(["./lite", "-config", "lite_config.json", "-test", PRE_TEST_FILE], timeout=720)
             
-            # 精确校验原生 JSON 输出，只有 ping ＞ 0 且有效回包的才予以放行
             if os.path.exists("output.txt"):
                 try:
                     content = open("output.txt", "r", encoding="utf-8", errors="ignore").read().strip()
@@ -596,7 +593,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
                             if float(ping_str) > 0:
                                 if link := node.get("link", ""): alive_nodes.append(link)
                     else:
-                        # 极端兜底：如果没生成 JSON，则过滤名字里含有 TIMEOUT/ERROR 的节点
                         for uri in extract_nodes_from_text(content):
                             if not any(bad in extract_original_name(uri).upper() for bad in ("TIMEOUT", "FAIL", "ERROR", "N/A")):
                                 alive_nodes.append(uri)
