@@ -25,8 +25,6 @@ MAX_FAIL_STREAK = 3
 VALID_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "wg://")
 
 # 插件文件名(去 .py) → 节点名来源前缀
-# 用于 `🇭🇰 香港 01 | {来源前缀}{原节点名}` 这种一目了然的命名。
-# 未列出的插件默认用文件名本身作前缀。
 PLUGIN_TAGS = {
     "de": "DE", "devpn": "DE", "dsfunique": "DE",
     "ipow": "iPoW", "iPow": "iPoW",
@@ -43,17 +41,14 @@ PLUGIN_TAGS = {
 
 
 def plugin_tag(script_name):
-    """插件文件名 → 来源前缀（去掉 .py）。用于节点名 `| 前缀原名`。"""
     stem = os.path.splitext(os.path.basename(script_name))[0]
     return PLUGIN_TAGS.get(stem, stem)
 
 def get_beijing_time():
-    """获取北京时间字符串"""
     tz_bj = timezone(timedelta(hours=8))
     return datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_interval(py_path):
-    """读取 py 文件前 5 行的 # @interval: 标记，返回秒数（默认 50m）"""
     default_sec = 50 * 60
     try:
         with open(py_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -75,11 +70,9 @@ def format_interval(sec):
     return f"{sec // 60}分钟"
 
 def try_b64_decode(s):
-    """尝试 Base64 解码（支持 urlsafe 变体）"""
     s = s.strip()
     if not s:
         return None
-    # 去掉可能的空白控制符（单行订阅偶尔带换行/回车）
     s = re.sub(r'[\s\r\n]+', '', s)
     if len(s) < 8:
         return None
@@ -88,13 +81,11 @@ def try_b64_decode(s):
         if missing_padding:
             s += '=' * (4 - missing_padding)
         dec = base64.b64decode(s, validate=False)
-        # 解码结果必须是可打印文本（避免把随机字节误判为 b64）
         text = dec.decode('utf-8', errors='ignore')
         if text and all(ord(c) >= 32 or c in '\r\n\t' for c in text):
             return text
     except Exception:
         pass
-    # urlsafe 变体（base64.urlsafe_b64encode 产物）
     try:
         s2 = s.replace('-', '+').replace('_', '/')
         missing_padding = len(s2) % 4
@@ -114,7 +105,6 @@ def quote_safe(s):
 
 
 def clash_proxy_to_uri(p):
-    """将 Clash YAML 中的单个 proxy 字典转换为标准节点 URI 以便统一管理"""
     try:
         ptype = p.get("type", "").lower()
         name = quote_safe(str(p.get("name", "Clash_Node")))
@@ -160,20 +150,16 @@ def clash_proxy_to_uri(p):
 
 
 def _contains_scheme(text):
-    """判断文本里是否含任意合法节点 scheme"""
     return any(sch in text for sch in VALID_SCHEMES)
 
 
 def _deep_extract(content, depth=0):
-    """递归提取：处理多层 Base64 嵌套（b64 套 b64）+ 单行长 b64 订阅展开。
-    返回去重后的节点列表，最多递归 3 层防死循环。"""
     if depth > 3:
         return []
     content = content.strip()
     if not content:
         return []
     nodes, seen = [], set()
-    # 整块是多行结构：先逐行提取
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -183,7 +169,6 @@ def _deep_extract(content, depth=0):
                 seen.add(line)
                 nodes.append(line)
             continue
-        # 单行可能是 b64 订阅（解一层，里面可能又有 b64 或明文节点）
         sub_dec = try_b64_decode(line)
         if sub_dec:
             inner = _deep_extract(sub_dec, depth + 1)
@@ -191,7 +176,6 @@ def _deep_extract(content, depth=0):
                 if n not in seen:
                     seen.add(n)
                     nodes.append(n)
-    # 整块 content 本身可能是单层 b64（如整个文件就是一行 b64）
     if not nodes and len(content) < 200000:
         whole_dec = try_b64_decode(content)
         if whole_dec and _contains_scheme(whole_dec):
@@ -203,14 +187,11 @@ def _deep_extract(content, depth=0):
 
 
 def extract_nodes_from_text(content):
-    """万用提取器：支持明文、多级 Base64 订阅、Clash YAML 混杂提取。
-    采用递归深提取，能处理 b64 套 b64（如 lanmao_sub_base64.txt / sub_base64.txt 二次嵌套）。"""
     nodes = []
     content = content.strip()
     if not content:
         return nodes
 
-    # Clash YAML 块（独立解析，不让它挡住其他来源）
     yaml_nodes = []
     if "proxies:" in content:
         try:
@@ -223,10 +204,8 @@ def extract_nodes_from_text(content):
         except Exception:
             pass
 
-    # 通用递归提取（覆盖明文 + 多级 b64）
     text_nodes = _deep_extract(content, 0)
 
-    # 合并去重（preserve order）
     seen = set()
     merged = []
     for n in yaml_nodes + text_nodes:
@@ -236,7 +215,6 @@ def extract_nodes_from_text(content):
     return merged
 
 def get_node_fingerprint(uri):
-    """计算节点的唯一底层指纹（忽略节点名称，按 协议+服务器+端口+密码/UUID 去重）"""
     try:
         if uri.startswith("vmess://"):
             b64 = uri[8:].split("#")[0]
@@ -251,7 +229,6 @@ def get_node_fingerprint(uri):
         return hashlib.md5(uri.encode()).hexdigest()
 
 def extract_original_name(uri):
-    """提取节点的原始备注名称"""
     try:
         if uri.startswith("vmess://"):
             b64 = uri[8:].split("#")[0].strip()
@@ -266,18 +243,13 @@ def extract_original_name(uri):
         pass
     return "未命名节点"
 
-# ---- 确定性死节点过滤（零成本参数级保险层，不联网）----
 DEAD_UUID = "00000000-0000-0000-0000-000000000000"
 BAD_HOSTS = {"127.0.0.1", "0.0.0.0", "localhost", "::1"}
 BAD_PORTS = {"0", "1"}
-# xhttp/vless reality 常见畸形：sni=ip、缺 pbk 但仍标 reality
 _RE_HOST_PORT = re.compile(r'^[a-z0-9]+://[^@/]+@([^:/?#]+):(\d+)')
 
 
 def filter_dead_pairs(nodes):
-    """剔除参数上注定连不上的节点（全零 uuid、回环地址、无效端口）。
-    在指纹去重后、真连接测速前跑，省下 LiteSpeedTest 的测速配额。
-    只做参数级判断，绝不联网，避免误杀正常节点。"""
     import re
     out, dropped = [], 0
     for link in nodes:
@@ -298,27 +270,19 @@ def filter_dead_pairs(nodes):
     return out
 
 def detect_region_flag(raw_name):
-    """根据原节点名称识别国家/地区，返回 `国旗 地区` 前缀。
-    多级兜底，优先级：城市名(长优先) -> 中文/英文地区关键词 -> 旗帜 emoji -> 国家代码 -> 自动 -> 未知。
-    城市粒度可在客户端一眼区分东京/大阪、多伦多/温哥华。"""
     if not raw_name:
         return "🌐 其它"
     name = raw_name
     upper = name.upper()
 
-    # 1) 城市名（长优先，避免「东京」抢占「日本东京」这类）
     for city, flag in DETECT_CITY:
         if city in name:
             return flag
 
-    # 2) 匹配地区关键词。
-    #    中文词用子串（安全）；纯英文**国家代码**(两字码如 AU/US/HK/JP) 绝不能子串匹配——
-    #    AUTO 会命中 AU、RUSSIA 会命中 US、JAPANESE 会命中 JP。故英文一律走下面词元匹配。
     for kw, flag in DETECT_CN:
         if kw in name:
             return flag
 
-    # 3) 旗帜 emoji（名字里无文字线索时的兜底）
     import re as _re
     m = _re.findall(r'[\U0001F1E6-\U0001F1FF]{2}', name)
     for emoji in m:
@@ -326,44 +290,35 @@ def detect_region_flag(raw_name):
         if cc in DETECT_CC_BY_CODE:
             return DETECT_CC_BY_CODE[cc]
 
-    # 4) 独立国家/地区代码词元（避免“DeVPN”里的 DE、AUTO 里的 AU、RUSSIA 里的 US 误判）
     import re as _re2
     toks = set(_re2.split(r'[^A-Za-z0-9]+', upper))
     for cc in sorted(toks & set(DETECT_CC_BY_CODE)):
         return DETECT_CC_BY_CODE[cc]
 
-    # 5) 自动/负载均衡入口
     if any(k in upper for k in ("自动", "AUTO", "LOADBALANCE", "负载均衡", "随机", "BEST")):
         return "🌐 自动"
 
     return "🌐 其它"
 
 
-# 城市粒度识别表（长优先排序在构建时处理）
 _DETECT_CITY_RAW = [
-    # 日本
     ("东京", "🇯🇵 东京"), ("大阪", "🇯🇵 大阪"), ("名古屋", "🇯🇵 名古屋"), ("札幌", "🇯🇵 札幌"),
     ("福冈", "🇯🇵 福冈"), ("横滨", "🇯🇵 横滨"), ("埼玉", "🇯🇵 埼玉"), ("TOKYO", "🇯🇵 东京"),
     ("OSAKA", "🇯🇵 大阪"), ("NAGOYA", "🇯🇵 名古屋"), ("NRT", "🇯🇵 东京"), ("KIX", "🇯🇵 大阪"), ("TYO", "🇯🇵 东京"),
-    # 韩国
     ("首尔", "🇰🇷 首尔"), ("釜山", "🇰🇷 釜山"), ("仁川", "🇰🇷 仁川"),
     ("SEOUL", "🇰🇷 首尔"), ("ICN", "🇰🇷 首尔"), ("BUSAN", "🇰🇷 釜山"),
-    # 台湾
     ("台北", "🇹🇼 台北"), ("新北", "🇹🇼 新北"), ("高雄", "🇹🇼 高雄"), ("台中", "🇹🇼 台中"),
     ("台南", "🇹🇼 台南"), ("TAIPEI", "🇹🇼 台北"), ("TPE", "🇹🇼 台北"),
-    # 东南亚
     ("新加坡", "🇸🇬 新加坡"), ("狮城", "🇸🇬 新加坡"), ("SINGAPORE", "🇸🇬 新加坡"), ("SIN", "🇸🇬 新加坡"),
     ("雅加达", "🇮🇩 雅加达"), ("JAKARTA", "🇮🇩 雅加达"), ("CGK", "🇮🇩 雅加达"),
     ("吉隆坡", "🇲🇾 吉隆坡"), ("KUALA", "🇲🇾 吉隆坡"), ("KUL", "🇲🇾 吉隆坡"),
     ("曼谷", "🇹🇭 曼谷"), ("BANGKOK", "🇹🇭 曼谷"), ("BKK", "🇹🇭 曼谷"),
     ("马尼拉", "🇵🇭 马尼拉"), ("MANILA", "🇵🇭 马尼拉"), ("MNL", "🇵🇭 马尼拉"),
     ("河内", "🇻🇳 河内"), ("胡志明", "🇻🇳 胡志明"), ("HANOI", "🇻🇳 河内"), ("HCM", "🇻🇳 胡志明"),
-    # 南亚/中东
     ("孟买", "🇮🇳 孟买"), ("班加罗尔", "🇮🇳 班加罗尔"), ("新德里", "🇮🇳 新德里"), ("金奈", "🇮🇳 金奈"),
     ("达卡", "🇧🇩 达卡"), ("MUMBAI", "🇮🇳 孟买"), ("BOM", "🇮🇳 孟买"), ("BLR", "🇮🇳 班加罗尔"), ("DELHI", "🇮🇳 新德里"),
     ("迪拜", "🇦🇪 迪拜"), ("阿布扎比", "🇦🇪 阿布扎比"), ("DUBAI", "🇦🇪 迪拜"),
     ("伊斯坦布尔", "🇹🇷 伊斯坦布尔"), ("IST", "🇹🇷 伊斯坦布尔"),
-    # 欧洲
     ("法兰克福", "🇩🇪 法兰克福"), ("柏林", "🇩🇪 柏林"), ("慕尼黑", "🇩🇪 慕尼黑"),
     ("FRANKFURT", "🇩🇪 法兰克福"), ("FRA", "🇩🇪 法兰克福"), ("BERLIN", "🇩🇪 柏林"),
     ("巴黎", "🇫🇷 巴黎"), ("马赛", "🇫🇷 马赛"), ("PARIS", "🇫🇷 巴黎"), ("CDG", "🇫🇷 巴黎"),
@@ -375,23 +330,19 @@ _DETECT_CITY_RAW = [
     ("华沙", "🇵🇱 华沙"), ("斯德哥尔摩", "🇸🇪 斯德哥尔摩"), ("赫尔辛基", "🇫🇮 赫尔辛基"),
     ("维也纳", "🇦🇹 维也纳"), ("布拉格", "🇨🇿 布拉格"), ("布达佩斯", "🇭🇺 布达佩斯"),
     ("莫斯科", "🇷🇺 莫斯科"), ("圣彼得堡", "🇷🇺 圣彼得堡"), ("MOW", "🇷🇺 莫斯科"),
-    # 北美
     ("多伦多", "🇨🇦 多伦多"), ("温哥华", "🇨🇦 温哥华"), ("蒙特利尔", "🇨🇦 蒙特利尔"), ("卡尔加里", "🇨🇦 卡尔加里"),
     ("TORONTO", "🇨🇦 多伦多"), ("YVR", "🇨🇦 温哥华"), ("YYZ", "🇨🇦 多伦多"),
     ("洛杉矶", "🇺🇸 洛杉矶"), ("圣克拉拉", "🇺🇸 圣克拉拉"), ("圣何塞", "🇺🇸 圣何塞"),
     ("西雅图", "🇺🇸 西雅图"), ("达拉斯", "🇺🇸 达拉斯"), ("纽约", "🇺🇸 纽约"), ("芝加哥", "🇺🇸 芝加哥"),
     ("凤凰城", "🇺🇸 凤凰城"), ("迈阿密", "🇺🇸 迈阿密"), ("硅谷", "🇺🇸 硅谷"), ("拉斯维加斯", "🇺🇸 拉斯维加斯"),
     ("LAX", "🇺🇸 洛杉矶"), ("SEA", "🇺🇸 西雅图"), ("NYC", "🇺🇸 纽约"), ("SJC", "🇺🇸 圣何塞"), ("ORD", "🇺🇸 芝加哥"),
-    # 南美
     ("圣保罗", "🇧🇷 圣保罗"), ("里约", "🇧🇷 里约"), ("SAO", "🇧🇷 圣保罗"), ("GRU", "🇧🇷 圣保罗"),
     ("布宜诺斯艾利斯", "🇦🇷 布宜诺斯艾利斯"),
-    # 大洋洲/非洲
     ("悉尼", "🇦🇺 悉尼"), ("墨尔本", "🇦🇺 墨尔本"), ("SYD", "🇦🇺 悉尼"), ("MEL", "🇦🇺 墨尔本"),
     ("奥克兰", "🇳🇿 奥克兰"), ("约翰内斯堡", "🇿🇦 约翰内斯堡"), ("开普敦", "🇿🇦 开普敦"), ("JNB", "🇿🇦 约翰内斯堡"),
 ]
 DETECT_CITY = sorted(_DETECT_CITY_RAW, key=lambda x: -len(x[0]))
 
-# 中文/英文地区关键词表（长优先）
 _DETECT_CN_RAW = [
     ("印度尼西亚", "🇮🇩 印尼"), ("印度尼西亞", "🇮🇩 印尼"), ("印度尼西亚", "🇮🇩 印尼"),
     ("澳大利亚", "🇦🇺 澳大利亚"), ("澳洲", "🇦🇺 澳大利亚"), ("台灣", "🇹🇼 台湾"), ("台湾", "🇹🇼 台湾"),
@@ -400,7 +351,6 @@ _DETECT_CN_RAW = [
     ("意大利", "🇮🇹 意大利"), ("ITALY", "🇮🇹 意大利"), ("西班牙", "🇪🇸 西班牙"), ("SPAIN", "🇪🇸 西班牙"), ("瑞士", "🇨🇭 瑞士"), ("SWITZERLAND", "🇨🇭 瑞士"), ("瑞典", "🇸🇪 瑞典"), ("SWEDEN", "🇸🇪 瑞典"), ("波兰", "🇵🇱 波兰"), ("POLAND", "🇵🇱 波兰"), ("阿联酋", "🇦🇪 阿联酋"), ("UAE", "🇦🇪 阿联酋"), ("埃及", "🇪🇬 埃及"), ("EGYPT", "🇪🇬 埃及"), ("阿根廷", "🇦🇷 阿根廷"), ("ARGENTINA", "🇦🇷 阿根廷"), ("智利", "🇨🇱 智利"), ("CHILE", "🇨🇱 智利"), ("墨西哥", "🇲🇽 墨西哥"), ("MEXICO", "🇲🇽 墨西哥"), ("比利时", "🇧🇪 比利时"), ("BELGIUM", "🇧🇪 比利时"), ("奥地利", "🇦🇹 奥地利"), ("AUSTRIA", "🇦🇹 奥地利"), ("丹麦", "🇩🇰 丹麦"), ("DENMARK", "🇩🇰 丹麦"), ("芬兰", "🇫🇮 芬兰"), ("FINLAND", "🇫🇮 芬兰"), ("挪威", "🇳🇴 挪威"), ("NORWAY", "🇳🇴 挪威"), ("捷克", "🇨🇿 捷克"), ("CZECH", "🇨🇿 捷克"), ]
 DETECT_CN = sorted(_DETECT_CN_RAW, key=lambda x: -len(x[0]))
 
-# 国家/地区代码 → 旗帜前缀
 DETECT_CC_BY_CODE = {}
 for _cc, _flag in [
     ("HK", "🇭🇰 香港"), ("TW", "🇹🇼 台湾"), ("JP", "🇯🇵 日本"), ("KP", "🇰🇵 朝鲜"), ("KR", "🇰🇷 韩国"),
@@ -419,7 +369,6 @@ for _cc, _flag in [
     DETECT_CC_BY_CODE[_cc] = _flag
 
 def apply_new_node_name(uri, new_name):
-    """将格式化后的新名称写回节点"""
     try:
         if uri.startswith("vmess://"):
             b64 = uri[8:].split("#")[0].strip()
@@ -435,21 +384,15 @@ def apply_new_node_name(uri, new_name):
 
 
 def apply_source_prefix(uri, tag):
-    """给节点名加上 `{来源前缀}`，形如 `DE香港`、`iPoW香港2`、`sulian自动`。
-    拼接前剥掉原名里自带的旗帜 emoji（前面 `🇭🇰 香港 01 |` 已显示地区，避免 `DE🇭🇰香港01` 重复）。
-    只在原名未带该前缀时加，避免重复叠加。仅改名字，不动协议参数。
-    返回新 uri。vmess 走 ps 字段，其余走 `#` 片段。"""
     orig = extract_original_name(uri)
     if not orig or orig == "未命名节点":
         orig = tag
-    # 剥掉旗帜 emoji（U+1F1E6-1F1FF 成对），只留文字部分
     import re as _re
     orig = _re.sub(r'[\U0001F1E6-\U0001F1FF]{2}', '', orig).strip()
     if orig.startswith("|"):
         orig = orig[1:].strip()
     if not orig:
         orig = tag
-    # 已带前缀（如 `DE香港` 本就有 DE）不再叠加
     if orig.startswith(tag):
         return uri
     new_name = f"{tag}{orig}"
@@ -457,7 +400,6 @@ def apply_source_prefix(uri, tag):
 
 
 def uri_to_clash_proxy(uri):
-    """将标准 URI 转换为支持 Mihomo/Clash.Meta 的 Proxy 字典 (支持 VLESS Reality / Hy2)"""
     try:
         name = extract_original_name(uri)
         if uri.startswith("vmess://"):
@@ -505,7 +447,6 @@ def uri_to_clash_proxy(uri):
             elif proxy["network"] == "grpc":
                 proxy["grpc-opts"] = {"grpc-service-name": q.get("serviceName", "")}
             elif proxy["network"] == "xhttp":
-                # xhttp（XHTTP/HTTP3 系）—— iPoW 官方 v4.3.9 新链路（/v1/vpn/configs）默认传输层
                 opts = {"path": q.get("path", "/")}
                 if q.get("mode"): opts["mode"] = q["mode"]
                 proxy["xhttp-opts"] = opts
@@ -548,7 +489,6 @@ def uri_to_clash_proxy(uri):
     return None
 
 def export_clash_yaml(final_nodes, out_path):
-    """原生生成支持 Mihomo / Clash.Meta 的 clash.yaml 配置文件"""
     proxies = []
     proxy_names = []
     for uri in final_nodes:
@@ -576,7 +516,7 @@ def export_clash_yaml(final_nodes, out_path):
         "proxies": proxies,
         "proxy-groups": [
             {"name": "🚀 节点选择", "type": "select", "proxies": ["⚡ 自动优选", "🔯 故障转移"] + proxy_names},
-            {"name": "⚡ 自动优选", "type": "url-test", " proxies": proxy_names, "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50},
+            {"name": "⚡ 自动优选", "type": "url-test", "proxies": proxy_names, "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50},
             {"name": "🔯 故障转移", "type": "fallback", "proxies": proxy_names, "url": "http://www.gstatic.com/generate_204", "interval": 300}
         ],
         "rules": [
@@ -585,24 +525,15 @@ def export_clash_yaml(final_nodes, out_path):
             "MATCH,🚀 节点选择"
         ]
     }
-    # 修正键名空格
-    clash_Wait["proxy-groups"][1]["proxies"] = proxy_names
-    clash_Wait["proxy-groups"][1].pop(" proxies", None)
-
     with open(out_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(clash_Wait, f, allow_unicode=True, sort_keys=False)
     return len(proxies)
 
-# ---- gist 双通道冗余备份（可选）----
-# 私有库 + CF 绑定是主通道；这里是备用通道，防止 GIT_TOKEN 失效/私有库异常时订阅断供。
-# 只在设置了 GIST_TOKEN 环境变量时启用；未设置则静默跳过。
 GIST_DESC = "poly-sub-backup"
 GIST_FILENAME = "sub_base64.txt"
 
 
 def upload_to_gist_backup(content):
-    """把 Base64 订阅上传到私有 Gist，返回 raw 直链（失败返回 None）。
-    复用已有 gist（按 description 匹配），没有则新建。"""
     import requests as _rq
     token = (os.environ.get("GIST_TOKEN") or "").strip()
     if not token:
@@ -640,7 +571,6 @@ def upload_to_gist_backup(content):
 
 
 def run_plugins_with_cache():
-    """核心分频调度器 + 脚本失效监控"""
     os.makedirs(VAULT_DIR, exist_ok=True)
     state = {}
     if os.path.exists(STATE_FILE):
@@ -654,7 +584,6 @@ def run_plugins_with_cache():
     py_files = sorted(glob.glob(os.path.join(PLUGIN_DIR, "*.py")))
     active_script_names = {os.path.basename(p) for p in py_files}
 
-    # 自动清理已经在 plugins 目录被你手动删除的脚本缓存记录
     for old_key in list(state.keys()):
         if old_key not in active_script_names:
             del state[old_key]
@@ -670,7 +599,6 @@ def run_plugins_with_cache():
         info = state.get(script_name, {})
         last_run = info.get("last_run", 0)
         cached_nodes = info.get("nodes", [])
-        # 旧缓存可能未带来源前缀（来自旧版本），统一补上（已带则跳过）
         if cached_nodes:
             _tag = plugin_tag(script_name)
             cached_nodes = [apply_source_prefix(u, _tag) for u in cached_nodes]
@@ -707,7 +635,6 @@ def run_plugins_with_cache():
                             pass
 
                 if extracted:
-                    # 给每个节点名加来源前缀（DE香港 / iPoW香港2 / sulian自动）
                     tag = plugin_tag(script_name)
                     extracted = [apply_source_prefix(u, tag) for u in extracted]
                     print(f"   ✅ 成功从 {script_name} 提取到 {len(extracted)} 条节点，已重置失败计数！")
@@ -786,7 +713,6 @@ def run_plugins_with_cache():
     return all_raw_nodes, plugin_reports
 
 def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region_counters, plugin_reports):
-    """生成可视化统计看板（同时写入私有库 README.md 与 GitHub Actions Summary）"""
     dead_scripts = [p["name"] for p in plugin_reports if p["fail_count"] >= MAX_FAIL_STREAK]
     
     lines = [
@@ -824,11 +750,9 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
 
     report_md = "\n".join(lines)
 
-    # 1. 写入私有库 README.md，打开私有库主页直接可见
     with open(os.path.join(VAULT_DIR, "README.md"), "w", encoding="utf-8") as f:
         f.write(report_md)
 
-    # 2. 写入 GitHub Actions 官方 Summary 面板
     summary_env = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_env:
         try:
@@ -837,7 +761,6 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
         except Exception:
             pass
 
-    # 3. 在控制台打印精简尾声汇总
     print("\n" + "=" * 60)
     print(f"📊 【本次聚合战报】 原始:{raw_count} -> 去重:{unique_count} -> 测速存活:{alive_count} -> Clash:{clash_count}")
     if dead_scripts:
@@ -847,7 +770,6 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
     print("=" * 60 + "\n")
 
 def deduplicate_and_speedtest(raw_nodes, plugin_reports):
-    """指纹去重 + 调用内核进行真连接测速 + 导出成品与看板"""
     unique_map = {}
     for uri in raw_nodes:
         fp = get_node_fingerprint(uri)
@@ -857,7 +779,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     unique_nodes = list(unique_map.values())
     print(f"🔍 汇总总数: {len(raw_nodes)} | 指纹深度去重后: {len(unique_nodes)} 条")
 
-    # 确定性死节点预筛（零成本，全零uuid/回环/无效端口）—— 在真测速前省配额
     unique_nodes = filter_dead_pairs(unique_nodes)
     print(f"🧪 参数级预筛后剩余: {len(unique_nodes)} 条")
 
@@ -902,7 +823,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     else:
         print(f"🎯 真连接测速完成！存活真节点: {len(alive_nodes)} / {len(unique_nodes)} 条")
 
-    # 智能归类国家国旗 + 保留原节点备注
     region_counters = {}
     final_nodes = []
     for uri in alive_nodes:
@@ -914,19 +834,15 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
         new_label = f"{region_flag} {seq:02d} | {orig_name}"
         final_nodes.append(apply_new_node_name(uri, new_label))
 
-    # 导出 1：明文列表 (nodes_plain.txt)
     with open(os.path.join(VAULT_DIR, "nodes_plain.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(final_nodes))
 
-    # 导出 2：通用 Base64 订阅 (sub_base64.txt)
     b64_str = base64.b64encode("\n".join(final_nodes).encode("utf-8")).decode("utf-8")
     with open(os.path.join(VAULT_DIR, "sub_base64.txt"), "w", encoding="utf-8") as f:
         f.write(b64_str)
 
-    # 导出 3：原生生成 Clash Meta 配置文件 (clash.yaml)
     clash_count = export_clash_yaml(final_nodes, os.path.join(VAULT_DIR, "clash.yaml"))
 
-    # gist 双通道冗余备份（可选项，GIST_TOKEN 存在才生效）
     gist_url = upload_to_gist_backup(b64_str)
     if gist_url:
         report_note = f"\n> 🔗 gist 备份订阅：`{gist_url}`\n"
@@ -940,7 +856,6 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
             except Exception:
                 pass
 
-    # 生成可视化监控看板
     generate_dashboard(len(raw_nodes), len(unique_nodes), len(final_nodes), clash_count, region_counters, plugin_reports)
 
 if __name__ == "__main__":
