@@ -14,14 +14,12 @@ jobs:
       - name: 1. 检出公开库代码
         uses: actions/checkout@v4
 
-      - name: 2. 🔐 私有库连通性预检 (Fail-Fast 防干等机制)
-        run: |
-          echo "🔍 正在预检私有库连通性与 Token 权限..."
-          # 移除了 x-access-token 前缀，直接使用 PAT 进行身份验证
-          git ls-remote https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git > /dev/null
-          
-          echo "✅ Token 认证成功，连通性测试通过！开始拉取历史缓存..."
-          git clone https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git vault_repo || mkdir -p vault_repo
+      - name: 2. 🔐 官方原生检出私有库 (100% 防踩坑认证)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/polymerization-1
+          token: ${{ secrets.GIT_TOKEN }}
+          path: vault_repo
 
       - name: 3. 🐍 配置 Python 环境并安装依赖
         uses: actions/setup-python@v5
@@ -42,20 +40,19 @@ jobs:
         run: |
           python -u main_engine.py
 
-      - name: 6. 🚀 覆盖推送到私有库 (无历史垃圾防膨胀)
+      - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
         run: |
           cd vault_repo
-          rm -rf .git
-          git init
           git config user.name "AggregatorBot"
           git config user.email "bot@noreply.github.com"
-          git branch -M main
+          
+          # 创建一个没有任何历史记录的全新孤儿分支（完美替代之前的 rm -rf .git）
+          git checkout --orphan new_main
           git add .
           NODE_COUNT=$(wc -l < nodes_plain.txt 2>/dev/null | tr -d ' ' || echo "0")
           git commit -m "Auto sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC') (存活: ${NODE_COUNT} 条)" || exit 0
           
           echo "📦 正在向私有库推送最新节点..."
-          # 移除了 x-access-token 前缀，直接使用 PAT 进行推送
-          git remote add origin https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git
-          git push -f origin main
+          # 直接利用官方配置好的安全通道强推，再也不用手动拼写 Token！
+          git push -f origin new_main:main
           echo "🎉 推送完成！"
