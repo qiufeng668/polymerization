@@ -17,11 +17,11 @@ jobs:
       - name: 2. 🔐 私有库连通性预检 (Fail-Fast 防干等机制)
         run: |
           echo "🔍 正在预检私有库连通性与 Token 权限..."
-          # 利用 ls-remote 秒级探测远端仓库。如果 Token 无效，这行会立刻报错并终止任务，绝不拖拉！
-          git ls-remote https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git > /dev/null
+          # 移除了 x-access-token 前缀，直接使用 PAT 进行身份验证
+          git ls-remote https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git > /dev/null
           
           echo "✅ Token 认证成功，连通性测试通过！开始拉取历史缓存..."
-          git clone https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git vault_repo || mkdir -p vault_repo
+          git clone https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git vault_repo || mkdir -p vault_repo
 
       - name: 3. 🐍 配置 Python 环境并安装依赖
         uses: actions/setup-python@v5
@@ -55,6 +55,7 @@ jobs:
           git commit -m "Auto sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC') (存活: ${NODE_COUNT} 条)" || exit 0
           
           echo "📦 正在向私有库推送最新节点..."
-          git remote add origin https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git
+          # 移除了 x-access-token 前缀，直接使用 PAT 进行推送
+          git remote add origin https://${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository_owner }}/polymerization-1.git
           git push -f origin main
           echo "🎉 推送完成！"
