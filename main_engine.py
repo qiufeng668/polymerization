@@ -1,6 +1,7 @@
 # main_engine.py
 import os
 import re
+import ast
 import json
 import time
 import glob
@@ -344,7 +345,9 @@ def uri_to_clash_proxy(uri):
             if q.get("sni"): proxy["servername"] = q["sni"]
             if q.get("fp"): proxy["client-fingerprint"] = q["fp"]
             if q.get("security") == "reality":
-                proxy["reality-opts"] = {"public-key": q.get("pbk", ""), "short-id": q.get("sid", "")}
+                sid = q.get("sid", "") or ""
+                if not re.fullmatch(r'[0-9a-fA-F]{2,16}', sid): sid = ""   # mihomo: hex偶数位≤16,否则空
+                proxy["reality-opts"] = {"public-key": q.get("pbk", ""), "short-id": sid}
             if proxy["network"] == "ws":
                 proxy["ws-opts"] = {"path": q.get("path", "/"), "headers": {"Host": q.get("host", q.get("sni", server))}}
             return proxy
@@ -356,8 +359,18 @@ def uri_to_clash_proxy(uri):
             }
             if q.get("sni"): proxy["sni"] = q["sni"]
             if q.get("obfs"):
-                proxy["obfs"] = q["obfs"]
-                if q.get("obfs-password"): proxy["obfs-password"] = q["obfs-password"]
+                ob = str(q["obfs"]).strip()
+                if ob.startswith("{"):          # safevpn 系把整个 dict 字符串塞进 URI
+                    try:
+                        od = ast.literal_eval(ob)
+                        proxy["obfs"] = od.get("type", "salamander")
+                        if od.get("password"): proxy["obfs-password"] = od["password"]
+                        elif q.get("obfs-password"): proxy["obfs-password"] = q["obfs-password"]
+                    except Exception:
+                        pass
+                else:
+                    proxy["obfs"] = ob
+                    if q.get("obfs-password"): proxy["obfs-password"] = q["obfs-password"]
             return proxy
 
         elif scheme == "trojan":
@@ -381,9 +394,23 @@ def uri_to_clash_proxy(uri):
     except Exception: pass
     return None
 
+class _QStr(str):
+    """强制带引号的字符串 —— 防 mihomo 端 yaml 把数字开头 hex/base64 字符串误解析成非 str"""
+def _qstr_repr(dumper, data):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="'")
+yaml.add_representer(_QStr, _qstr_repr, Dumper=yaml.SafeDumper)
+
+def _quote_all(o):
+    """递归把 proxies 及其子结构中的 str 全部换成 _QStr"""
+    if isinstance(o, str): return _QStr(o)
+    if isinstance(o, dict): return {k: _quote_all(v) for k, v in o.items()}
+    if isinstance(o, list): return [_quote_all(v) for v in o]
+    return o
+
 def export_clash_yaml(final_nodes, out_path):
     proxies = [p for uri in final_nodes if (p := uri_to_clash_proxy(uri)) and p.get("server")]
     if not proxies: return 0
+    proxies = _quote_all(proxies)
     proxy_names = [p["name"] for p in proxies]
 
     clash_Wait = {
@@ -402,8 +429,318 @@ def export_clash_yaml(final_nodes, out_path):
         yaml.safe_dump(clash_Wait, f, allow_unicode=True, sort_keys=False)
     return len(proxies)
 
+# ================= Egern 导出（2.20.0 原生 schema） ==================
+# 支持: vless tcp(VISION)+reality / vless wss / vless ws / vless tcp+tls
+#       vmess ws/wss / hysteria2 / ss / trojan(+reality)
+# 不支持则跳过: vless ws+reality(无此组合schema), vless xhttp(transport无此类型)
+def _eg_parse_qs_single(qs):
+    return {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()}
+
+def _eg_hostport(hp):
+    m = re.match(r'^(?:\[(.+)\]|([^:\[\]]+?)):([0-9]+)$', hp)
+    return ((m.group(1) or m.group(2)), int(m.group(3))) if m else (None, None)
+
+def _eg_vless(uri):
+    body = uri[8:]
+    frag = ''
+    if '#' in body: body, frag = body.split('#', 1)
+    hp, _, qs = body.partition('?')
+    if '@' not in hp: return None, 'no-uuid'
+    uuid, hp = hp.rsplit('@', 1)
+    host, port = _eg_hostport(hp)
+    if not host: return None, 'bad-hostport'
+    p = _eg_parse_qs_single(qs)
+    net, sec = p.get('type', 'tcp'), p.get('security', 'none')
+    name = unquote(frag) or f'vless-{host}'
+    flow = p.get('flow') or None
+    sni = p.get('sni') or p.get('host') or host
+    entry = {'name': name, 'server': host, 'port': port, 'user_id': uuid}
+    if net == 'ws':
+        if sec == 'reality': return None, 'ws+reality-egern-no'
+        w = {'path': p.get('path', '/'), 'headers': {'Host': p.get('host') or host}}
+        if sec == 'tls':
+            wss = {'path': w['path'], 'headers': w['headers'], 'sni': sni}
+            return {'vless': {**entry, 'transport': {'wss': wss}}}, None
+        return {'vless': {**entry, 'transport': {'ws': w}}}, None
+    if net in ('tcp', 'raw', ''):
+        tls = {}
+        if sec == 'reality':
+            need = p.get('pbk', '')
+            if not need: return None, 'reality-no-pbk'
+            tls = {'sni': sni, 'reality': {'public_key': need, 'short_id': p.get('sid', '') or '0'}}
+        elif sec == 'tls':
+            tls = {'sni': sni}
+        if tls:
+            return {'vless': {**entry, **({'flow': flow} if flow else {}), 'transport': {'tls': tls}}}, None
+        return None, 'tcp-no-tls-egern-no'
+    return None, f'net-{net}-egern-no'
+
+def _eg_vmess(uri):
+    raw = uri[8:]
+    frag = ''
+    if '#' in raw: raw, frag = raw.split('#', 1)
+    base = raw.rstrip('=')
+    s = base + '=' * ((4 - len(base) % 4) % 4)
+    try:
+        d = json.loads(base64.urlsafe_b64decode(s.encode()).decode('utf-8', 'ignore'))
+    except Exception:
+        return None, 'vmess-b64-fail'
+    host, port = d.get('add'), int(d.get('port', 443) or 443)
+    net, tls = d.get('net', 'tcp'), d.get('tls') == 'tls'
+    name = unquote(frag) or d.get('ps') or f'vmess-{host}'
+    if net == 'ws':
+        w = {'path': d.get('path', '/'), 'headers': {'Host': d.get('host') or host}}
+        if tls: w['sni'] = d.get('sni') or d.get('host') or host
+        t = {'wss': w} if tls else {'ws': {'path': w['path'], 'headers': w['headers']}}
+        return {'vmess': {'name': name, 'server': host, 'port': port,
+                          'user_id': d.get('id'), 'security': 'auto',
+                          'transport': t}}, None
+    return None, f'vmess-{net}-egern-no'
+
+def _eg_hy2(uri):
+    body = uri[11:]
+    frag = ''
+    if '#' in body: body, frag = body.split('#', 1)
+    hp, _, qs = body.partition('?')
+    if '@' not in hp: return None, 'bad-auth'
+    auth, hp = hp.rsplit('@', 1)
+    host, port = _eg_hostport(hp)
+    if not host: return None, 'bad-hostport'
+    p = _eg_parse_qs_single(qs)
+    e = {'name': unquote(frag) or f'hy2-{host}', 'server': host, 'port': port, 'auth': auth}
+    if p.get('sni'): e['sni'] = p['sni']
+    if p.get('insecure') == '1': e['skip_tls_verify'] = True
+    ob = str(p.get('obfs', '')).strip()
+    obpw = p.get('obfs-password', '') or ''
+    if ob.startswith('{'):                    # safevpn 系 dict 字符串
+        try:
+            od = ast.literal_eval(ob)
+            if od.get('type') == 'salamander':
+                e['obfs'] = 'salamander'
+                if od.get('password'): e['obfs_password'] = od['password']
+                elif obpw: e['obfs_password'] = obpw
+        except Exception:
+            pass
+    elif ob == 'salamander':
+        e['obfs'] = 'salamander'
+        if obpw: e['obfs_password'] = obpw
+    return {'hysteria2': e}, None
+
+_EG_PORT = [
+    ('vless://', _eg_vless), ('vmess://', _eg_vmess), ('hysteria2://', _eg_hy2),
+]
+
+def export_egern_yaml(final_nodes, out_path):
+    entries, drop = [], {}
+    for uri in final_nodes:
+        uri = uri.strip()
+        if not uri: continue
+        entry = None
+        for scheme, fn in _EG_PORT:
+            if uri.startswith(scheme):
+                entry, why = fn(uri); break
+        if entry is None:
+            why = locals().get('why', 'unknown-scheme')
+            drop[why] = drop.get(why, 0) + 1
+            continue
+        entries.append(entry)
+    if not entries:
+        print("⚠️ Egern 导出：0 条可用（全部组合不支持）")
+        return 0
+    names, seen, emitted = [], {}, ["proxies:"]
+
+    def _dump(kv, indent):
+        pad = '  ' * indent
+        out = []
+        for k, v in kv.items():
+            if isinstance(v, dict):
+                out.append(f'{pad}{k}:')
+                out += _dump(v, indent + 1)
+            elif isinstance(v, list):
+                out.append(f'{pad}{k}: [{", ".join(json.dumps(x, ensure_ascii=False) for x in v)}]')
+            elif isinstance(v, str) and not re.match(r'^[A-Za-z0-9_./:\-@ ]+$', v):
+                out.append(f'{pad}{k}: {json.dumps(v, ensure_ascii=False)}')
+            else:
+                out.append(f'{pad}{k}: {v}')
+        return out
+
+    for e in entries:
+        proto, d = list(e.items())[0]
+        n = d['name']
+        if n in seen:
+            seen[n] += 1
+            d['name'] = f'{n} ({seen[n]})'
+        else:
+            seen[n] = 1
+        names.append(d['name'])
+        emitted.append(f'  - {proto}:')
+        emitted += _dump(d, 3)
+    emitted += ['', 'policy-groups:',
+                '- select:', '    name: "PROXY"', '    policies:', '      - "AUTO"']
+    emitted += [f'      - "{n}"' for n in names]
+    emitted += ['- auto_test:', '    name: "AUTO"', '    policies:']
+    emitted += [f'      - "{n}"' for n in names]
+    emitted += ['    interval: 300', '    tolerance: 100', '    timeout: 5',
+                '    latency_test_url: "https://cp.cloudflare.com/generate_204"',
+                '', 'rules:']
+    for dom in ('qq.com', 'taobao.com', 'tmall.com', '163.com', '126.com',
+                'tencent.com', 'baidu.com', 'alipay.com', 'juejin.cn',
+                'aliyuncs.com', 'weixin.com', 'weixinbridge.com',
+                'legolegolego.cn', 'lanzoui.com', 'douyin.com', 'xdrig.com'):
+        emitted += ['  - domain_suffix:', f'      match: "{dom}"', '      policy: DIRECT']
+    emitted += ['  - geoip:', '      match: "CN"', '      policy: DIRECT',
+                '      no_resolve: true', '  - default:', '      policy: PROXY']
+    try:
+        yaml.safe_load("\n".join(emitted))  # 自检：不合法直接抛
+    except Exception as e:
+        print(f"⚠️ Egern YAML 自检失败 ({e})，跳过导出")
+        return 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(emitted) + "\n")
+    print(f"📱 Egern 导出：{len(entries)} 条 / 原始 {len(final_nodes)} 条，跳过 {sum(drop.values())} 条不支持组合")
+    for k, v in sorted(drop.items(), key=lambda x: -x[1]):
+        print(f"   · 跳过 {k}: {v} 条")
+    return len(entries)
+
 GIST_DESC = "poly-sub-backup"
 GIST_FILENAME = "sub_base64.txt"
+
+# ================= sing-box / Surge 导出 ==================
+def _sb_ws_transport(p):
+    w = p.get("ws-opts") or {}
+    hdrs = w.get("headers") if isinstance(w.get("headers"), dict) else {}
+    return {"type": "ws", "path": w.get("path", "/"), "headers": hdrs or {"Host": ""}}
+
+def _sb_tls(p):
+    tls = {"enabled": True}
+    n = p.get("servername") or p.get("sni")
+    if n: tls["server_name"] = n
+    if p.get("skip-cert-verify"): tls["insecure"] = True
+    ro = p.get("reality-opts")
+    if ro:
+        tls["reality"] = {"enabled": True, "public_key": ro.get("public-key", ""),
+                          "short_id": ro.get("short-id", "")}
+    if p.get("client-fingerprint"):
+        tls["utls"] = {"enabled": True, "fingerprint": p["client-fingerprint"]}
+    return tls
+
+def _clash_to_singbox(p):
+    t_, sv, pt = p["type"], p["server"], int(p["port"])
+    if t_ == "vless":
+        e = {"type": "vless", "tag": p["name"], "server": sv, "server_port": pt, "uuid": p.get("uuid", "")}
+        if p.get("flow"): e["flow"] = p["flow"]
+        if p.get("tls"): e["tls"] = _sb_tls(p)
+        if p.get("network") == "ws": e["transport"] = _sb_ws_transport(p)
+        if p.get("network") == "grpc":
+            g = p.get("grpc-opts") or {}
+            e["transport"] = {"type": "grpc", "service_name": g.get("grpc-service-name", "")}
+        return e
+    if t_ == "vmess":
+        e = {"type": "vmess", "tag": p["name"], "server": sv, "server_port": pt,
+             "uuid": p.get("uuid", ""), "security": p.get("cipher", "auto")}
+        if p.get("tls"): e["tls"] = _sb_tls(p)
+        if p.get("network") == "ws": e["transport"] = _sb_ws_transport(p)
+        return e
+    if t_ == "hysteria2":
+        e = {"type": "hysteria2", "tag": p["name"], "server": sv, "server_port": pt, "password": p.get("password", "")}
+        if p.get("obfs"):
+            e["obfs"] = {"type": "salamander", "password": p.get("obfs-password", "")}
+        e["tls"] = _sb_tls(p)
+        return e
+    if t_ == "ss":
+        return {"type": "shadowsocks", "tag": p["name"], "server": sv, "server_port": pt,
+                "method": p.get("cipher", "aes-256-gcm"), "password": p.get("password", "")}
+    if t_ == "trojan":
+        e = {"type": "trojan", "tag": p["name"], "server": sv, "server_port": pt, "password": p.get("password", "")}
+        e["tls"] = _sb_tls(p)
+        if p.get("network") == "ws": e["transport"] = _sb_ws_transport(p)
+        return e
+    return None
+
+def export_singbox_json(final_nodes, out_path):
+    out = []
+    for uri in final_nodes:
+        uri = uri.strip()
+        if not uri: continue
+        p = uri_to_clash_proxy(uri)
+        if not p or not p.get("server"): continue
+        e = _clash_to_singbox(p)
+        if e: out.append(e)
+    if not out:
+        print("⚠️ sing-box 导出：0 条可用"); return 0
+    names = [e["tag"] for e in out]
+    doc = {
+        "log": {"level": "warn"},
+        "outbounds": [{"type": "selector", "tag": "PROXY", "outbounds": ["AUTO"] + names},
+                      {"type": "urltest", "tag": "AUTO", "outbounds": names,
+                       "url": "https://cp.cloudflare.com/generate_204", "interval": "5m"}] + out,
+        "route": {"final": "PROXY", "auto_detect_interface": True}
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    print(f"🧩 sing-box 导出：{len(out)} 条 / 原始 {len(final_nodes)} 条")
+    return len(out)
+
+def _clash_to_surge_line(p):
+    t_, sv, pt, n = p["type"], p["server"], int(p["port"]), p["name"]
+    ncols = list(filter(None, []))
+    if t_ == "vmess":
+        parts = [f"{n} = vmess", sv, str(pt), f"username={p.get('uuid','')}", "vmess-aead=true"]
+        if p.get("network") == "ws":
+            w = p.get("ws-opts") or {}
+            parts += ["ws=true", f"ws-path={w.get('path','/')}"]
+            h = w.get("headers") or {}
+            if h.get("Host"): parts.append(f"ws-headers=Host:{h['Host']}")
+        if p.get("tls"): parts += ["tls=true", f"sni={p.get('servername') or p.get('sni') or sv}"]
+        if p.get("skip-cert-verify"): parts.append("skip-cert-verify=true")
+        parts.append("udp-relay=true")
+        return ",".join(parts)
+    if t_ == "hysteria2":
+        parts = [f"{n} = hysteria2", sv, str(pt), f"password={p.get('password','')}"]
+        sni = p.get("sni") or p.get("servername")
+        if sni: parts.append(f"sni={sni}")
+        opw = p.get("obfs-password")
+        if p.get("obfs") and opw: parts += ["obfs=salamander", f"obfs-password={opw}"]
+        if p.get("skip-cert-verify"): parts.append("skip-cert-verify=true")
+        parts.append("udp-relay=true")
+        return ",".join(parts)
+    if t_ == "ss":
+        return ",".join([f"{n} = shadowsocks", sv, str(pt),
+                         f"encrypt-method={p.get('cipher','')}", f"password={p.get('password','')}", "udp-relay=true"])
+    if t_ == "trojan":
+        parts = [f"{n} = trojan", sv, str(pt), f"password={p.get('password','')}"]
+        if p.get("sni"): parts.append(f"sni={p['sni']}")
+        if p.get("network") == "ws":
+            w = p.get("ws-opts") or {}
+            parts += ["ws=true", f"ws-path={w.get('path','/')}"]
+        parts.append("udp-relay=true")
+        return ",".join(parts)
+    return None
+
+def export_surge_ini(final_nodes, out_path):
+    body, nod = [], []
+    for uri in final_nodes:
+        uri = uri.strip()
+        if not uri: continue
+        p = uri_to_clash_proxy(uri)
+        if not p or not p.get("server"): continue
+        ln = _clash_to_surge_line(p)
+        if ln:
+            body.append(ln); nod.append(p["name"])
+    if not body:
+        print("⚠️ Surge 导出：0 条可用"); return 0
+    conf = (["[General]", "loglevel = notify", "dns-server = system",
+             "skip-proxy = 127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,*.local",
+             "", "[Proxy]"] + body
+            + ["", "[Proxy Group]",
+               "PROXY = select, AUTO, " + ", ".join(f'"{n}"' for n in nod),
+               "AUTO = url-test, " + ", ".join(f'"{n}"' for n in nod)
+               + ", url=http://www.gstatic.com/generate_204, interval=300",
+               "", "[Rule]", "GEOIP,CN,DIRECT", "FINAL,PROXY"])
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(conf) + "\n")
+    print(f"🖥 Surge/Surfboard 导出：{len(body)} 条（vless/xhttp Surge 不支持，已跳过）")
+    return len(body)
 
 def upload_to_gist_backup(content):
     import requests as _rq
@@ -661,6 +998,9 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     with open(os.path.join(VAULT_DIR, "sub_base64.txt"), "w", encoding="utf-8") as f: f.write(b64_str)
 
     clash_count = export_clash_yaml(final_nodes, os.path.join(VAULT_DIR, "clash.yaml"))
+    egern_count = export_egern_yaml(final_nodes, os.path.join(VAULT_DIR, "egern.yaml"))
+    singbox_count = export_singbox_json(final_nodes, os.path.join(VAULT_DIR, "sing-box.json"))
+    surge_count = export_surge_ini(final_nodes, os.path.join(VAULT_DIR, "surge.conf"))
     
     if gist_url := upload_to_gist_backup(b64_str):
         report_note = f"\n> 🔗 gist 备份订阅：`{gist_url}`\n"
