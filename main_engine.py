@@ -23,7 +23,7 @@ PRE_TEST_FILE = "pre_test_nodes.txt"
 MAX_FAIL_STREAK = 3
 # 测速存活延迟阈值（毫秒）：超过此值的节点判为大卡/不可用剔除。有 ping 值才判定；lost=0 但未报 ping 的不误杀。
 MAX_LATENCY_MS = 1000
-VALID_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "wg://")
+VALID_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "wg://", "anytls://")
 
 PLUGIN_TAGS = {
     "de": "DE", "devpn": "DE", "dsfunique": "DE",
@@ -37,6 +37,7 @@ PLUGIN_TAGS = {
     "cainiao": "cainiao", "菜鸟": "cainiao", "__": "cainiao",
     "Surfer": "SF", "surfer": "SF",
     "fengniao": "fengniao", "蜂鸟": "fengniao",
+    "wula": "wula", "乌拉": "wula", "ulavpn": "wula",
 }
 
 def plugin_tag(script_name):
@@ -384,6 +385,15 @@ def uri_to_clash_proxy(uri):
                 proxy["ws-opts"] = {"path": q.get("path", "/"), "headers": {"Host": q.get("host", server)}}
             return proxy
 
+        elif scheme == "anytls":
+            proxy = {
+                "name": name, "type": "anytls", "server": server, "port": int(port),
+                "password": userinfo, "udp": True, "skip-cert-verify": True
+            }
+            if q.get("sni"): proxy["sni"] = q["sni"]
+            if q.get("fp"): proxy["client-fingerprint"] = q["fp"]
+            return proxy
+
         elif scheme == "ss":
             if ":" not in userinfo:
                 dec = try_b64_decode(userinfo)
@@ -437,6 +447,7 @@ def _eg_parse_qs_single(qs):
     return {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()}
 
 def _eg_hostport(hp):
+    hp = hp.strip().split('/', 1)[0]   # anytls 等带 path: 111.x:5501/ → 111.x:5501
     m = re.match(r'^(?:\[(.+)\]|([^:\[\]]+?)):([0-9]+)$', hp)
     return ((m.group(1) or m.group(2)), int(m.group(3))) if m else (None, None)
 
@@ -498,7 +509,9 @@ def _eg_vmess(uri):
     return None, f'vmess-{net}-egern-no'
 
 def _eg_hy2(uri):
-    body = uri[11:]
+    if uri.startswith('hy2://'):
+        uri = 'hysteria2://' + uri[len('hy2://'):]
+    body = uri[len('hysteria2://'):]
     frag = ''
     if '#' in body: body, frag = body.split('#', 1)
     hp, _, qs = body.partition('?')
@@ -526,8 +539,24 @@ def _eg_hy2(uri):
         if obpw: e['obfs_password'] = obpw
     return {'hysteria2': e}, None
 
+def _eg_anytls(uri):
+    body = uri[9:]
+    frag = ''
+    if '#' in body: body, frag = body.split('#', 1)
+    hp, _, qs = body.partition('?')
+    if '@' not in hp: return None, 'bad-auth'
+    auth, hp = hp.rsplit('@', 1)
+    host, port = _eg_hostport(hp)
+    if not host: return None, 'bad-hostport'
+    p = _eg_parse_qs_single(qs)
+    e = {'name': unquote(frag) or f'anytls-{host}', 'server': host, 'port': port, 'password': auth}
+    if p.get('sni'): e['sni'] = p['sni']
+    if p.get('insecure') == '1': e['skip_tls_verify'] = True
+    return {'anytls': e}, None
+
 _EG_PORT = [
     ('vless://', _eg_vless), ('vmess://', _eg_vmess), ('hysteria2://', _eg_hy2),
+    ('hy2://', _eg_hy2), ('anytls://', _eg_anytls),
 ]
 
 def export_egern_yaml(final_nodes, out_path):
@@ -605,6 +634,22 @@ def export_egern_yaml(final_nodes, out_path):
 GIST_DESC = "poly-sub-backup"
 GIST_FILENAME = "sub_base64.txt"
 
+def export_wula_only(final_nodes, out_path, out_path_b64=None):
+    """乌拉VPN 单独导出文件：按最终命名格式输出 / 单独订阅渠道"""
+    out = []
+    for uri in final_nodes:
+        if not re.search(r"wula", extract_original_name(uri), re.I): continue
+        out.append(uri)
+    if not out:
+        print("ℹ️ wula 单独导出：0 条（本次无 wula 来源节点）")
+        return 0
+    with open(out_path, "w", encoding="utf-8") as f: f.write("\n".join(out) + "\n")
+    if out_path_b64:
+        b64 = base64.b64encode("\n".join(out).encode("utf-8")).decode("utf-8")
+        with open(out_path_b64, "w", encoding="utf-8") as f: f.write(b64)
+    print(f"🦅 wula 单独导出：{len(out)} 条 → {out_path} (base64: {out_path_b64})")
+    return len(out)
+
 # ================= sing-box / Surge 导出 ==================
 def _sb_ws_transport(p):
     w = p.get("ws-opts") or {}
@@ -655,6 +700,18 @@ def _clash_to_singbox(p):
         e["tls"] = _sb_tls(p)
         if p.get("network") == "ws": e["transport"] = _sb_ws_transport(p)
         return e
+    if t_ == "anytls":
+        e = {"type": "anytls", "tag": p["name"], "server": sv, "server_port": pt, "password": p.get("password", "")}
+        e["tls"] = {"enabled": True}
+        if p.get("sni"): e["tls"]["server_name"] = p["sni"]
+        if p.get("skip-cert-verify"): e["tls"]["insecure"] = True
+        return e
+    if t_ == "anytls":
+        e = {'name': n, 'server': sv, 'port': pt, 'password': p.get('password', '')}
+        sni = p.get('sni')
+        if sni: e['sni'] = sni
+        if p.get('skip-cert-verify'): e['skip_tls_verify'] = True
+        return {'anytls': e}
     return None
 
 def export_singbox_json(final_nodes, out_path):
@@ -817,7 +874,7 @@ def run_plugins_with_cache():
             shutil.copy(py_path, os.path.join(SANDBOX_DIR, script_name))
             
             try:
-                proc = subprocess.run(["python", script_name], cwd=SANDBOX_DIR, capture_output=False, text=True, timeout=300)
+                proc = subprocess.run(["python", script_name], cwd=SANDBOX_DIR, capture_output=False, text=True, timeout=600)
                 extracted = []
                 for root, _, files in os.walk(SANDBOX_DIR):
                     for file in files:
@@ -1001,6 +1058,8 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     egern_count = export_egern_yaml(final_nodes, os.path.join(VAULT_DIR, "egern.yaml"))
     singbox_count = export_singbox_json(final_nodes, os.path.join(VAULT_DIR, "sing-box.json"))
     surge_count = export_surge_ini(final_nodes, os.path.join(VAULT_DIR, "surge.conf"))
+    wula_count = export_wula_only(final_nodes, os.path.join(VAULT_DIR, "wula.txt"),
+                                  os.path.join(VAULT_DIR, "wula_base64.txt"))
     
     if gist_url := upload_to_gist_backup(b64_str):
         report_note = f"\n> 🔗 gist 备份订阅：`{gist_url}`\n"
