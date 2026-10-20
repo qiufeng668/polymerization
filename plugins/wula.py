@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+# @interval: 12h   (Actions 自动跑, 每次注册 1 个账号)
+# -*- coding: utf-8 -*-
+"""
+乌拉VPN (wula001.com) 批量自动注册 + 提取订阅链接  (自包含单文件版)
+# ============ 配置  ==== Tg == by_Jax ======
+依赖:
+    pip install requests   (仅此一个, 纯 Python 实现, 无需 Node.js)
+
+用法:
+    python3 wula.py 5          # 注册 5 个账号
+    python3 wula.py 10         # 注册 10 个账号
+    python3 wula.py 50         # 注册 50 个账号
+    python3 wula.py 5 --prefix myacc --password "Xx@123456" --threads 3
+
+输出:
+    accounts.json   JSON 格式
+    accounts.txt    每行: 邮箱 \t 密码 \t 订阅链接
+"""
+import json, time, sys, argparse, hashlib, os, random, string, re, base64, zlib, urllib.parse
+# 网络库: 有 curl_cffi 就用(可伪装 Chrome TLS), 没有就用标准库 requests(实测该站同样可用)
+try:
+    from curl_cffi import requests as _rq
+    _IMPERSONATE = "chrome"
+except ImportError:
+    import requests as _rq
+    _IMPERSONATE = None
+
+PROXY = None   # 例: "http://127.0.0.1:7890" 或 "socks5://127.0.0.1:1080"
+
+def _new_session():
+    if _IMPERSONATE:
+        s = _rq.Session(impersonate=_IMPERSONATE)
+    else:
+        s = _rq.Session()
+    if PROXY:
+        s.proxies = {"http": PROXY, "https": PROXY}
+    return s
+
+SUFFIXES = ["gmail.com", "qq.com", "163.com", "126.com", "outlook.com", "hotmail.com", "yahoo.com", "foxmail.com", "sina.com", "yeah.net"]
+
+BASE = "https://wula001.com"
+# 提示: 标准库 requests 即可直连, 无需额外依赖
+_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
+def _rand_ua():
+    return random.choice(_UAS)
+
+# ---------------- PoW (Hashcash 验证码求解) ----------------
+def _fnv1a(s):
+    h = 2166136261
+    for c in s:
+        h ^= ord(c)
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) & 0xFFFFFFFF
+    return h
+
+def _xorshift32(x):
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= (x >> 17)
+    x ^= (x << 5) & 0xFFFFFFFF
+    return x & 0xFFFFFFFF
+
+def _rand_hex(e, t):
+    x = _fnv1a(e)
+    s = ""
+    while len(s) < t:
+        x = _xorshift32(x)
+        s += format(x, "08x")
+    return s[:t]
+
+def _solve_pow(salt, target):
+    tb = bytes.fromhex(target) if len(target) % 2 == 0 else bytes.fromhex(target + "0")
+    nbytes = len(tb)
+    n = 0
+    while True:
+        if hashlib.sha256((salt + str(n)).encode()).digest()[:nbytes] == tb:
+            return n
+        n += 1
+
+def _solve_challenge(ch):
+    token = ch["token"]
+    c, s, d = ch["challenge"]["c"], ch["challenge"]["s"], ch["challenge"]["d"]
+    return [_solve_pow(_rand_hex(f"{token}{e}", s), _rand_hex(f"{token}{e}d", d))
+            for e in range(1, c + 1)]
+
+# ---------------- instr 指纹 (纯 Python, 无需 node) ----------------
+def _i32(x):
+    x &= 0xFFFFFFFF
+    return x - 0x100000000 if x >= 0x80000000 else x
+
+def _js_mod(a, n):
+    return a - n * int(a / n)
+
+def _js_shr(x, k):
+    return _i32(x) >> k
+
+def _f(J, u, k):
+    return _i32((u ^ J) | (k ^ u))
+
+class _Node:
+    __slots__ = ('children', 'parent', 'innerText')
+    def __init__(self):
+        self.children = []; self.parent = None; self.innerText = ""
+    def appendChild(self, c):
+        self.children.append(c); c.parent = self; return c
+    def removeChild(self, c):
+        self.children.remove(c); c.parent = None; return c
+    @property
+    def lastElementChild(self):
+        return self.children[-1]
+
+def _dom(J, c, a):
+    root = _Node(); body = _Node(); body.appendChild(root)
+    def k(l, j):
+        for E in range(8):
+            f = _Node(); l.appendChild(f); f.innerText = str(j)
+            if (_i32(j) & 1) == 0:
+                l = f
+            j = _js_shr(j, 1)
+        return l
+    def N(l, j, v):
+        if (l is None) or (l == j):
+            return _js_mod(v, 0x100)
+        while len(l.children) > 0:
+            l.removeChild(l.lastElementChild)
+        val = int(l.innerText) if l.innerText else 0
+        return N(l.parent, j, _i32(v + val))
+    w = N(k(k(k(root, J), c), a), root, 0)
+    body.removeChild(root)
+    return w
+
+def _replace_iife(seg):
+    out = []; i = 0; n = len(seg)
+    while i < n:
+        if seg.startswith('function(', i):
+            brace = seg.index('{', i)
+            depth = 0; k = brace
+            while k < n:
+                if seg[k] == '{': depth += 1
+                elif seg[k] == '}':
+                    depth -= 1
+                    if depth == 0: break
+                k += 1
+            body = seg[brace + 1:k]
+            call = seg.index('(', k + 1)
+            depth = 0; m = call
+            while m < n:
+                if seg[m] == '(': depth += 1
+                elif seg[m] == ')':
+                    depth -= 1
+                    if depth == 0: break
+                m += 1
+            args = seg[call + 1:m].strip()
+            if 'createElement' in body or 'appendChild' in body:
+                out.append('__DOM__(%s)' % args)
+            else:
+                out.append('__F__(%s)' % args)
+            i = m + 1
+        else:
+            out.append(seg[i]); i += 1
+    return ''.join(out)
+
+def _split_top(seg):
+    parts = []; depth = 0; cur = []
+    for ch in seg:
+        if ch in '([': depth += 1
+        elif ch in ')]': depth -= 1
+        if depth == 0 and ch in ',;':
+            parts.append(''.join(cur)); cur = []
+        else:
+            cur.append(ch)
+    if cur: parts.append(''.join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+def _eval_expr(rhs, env):
+    rhs = rhs.strip()
+    m = re.fullmatch(r'\(\((\w+)\^0x([0-9a-f]+)\)&0x7fffffff\)%0x([0-9a-f]+)\+0x([0-9a-f]+)', rhs)
+    if m:
+        var, x1, mod, add = m.groups()
+        v = env[var]
+        return _i32(((v ^ int(x1, 16)) & 0x7fffffff) % int(mod, 16) + int(add, 16))
+    m = re.fullmatch(r'__F__\((\w+),(\w+),(\w+)\)', rhs)
+    if m:
+        a, b, c = m.groups()
+        return _f(env[a], env[b], env[c])
+    m = re.fullmatch(r'__DOM__\((\w+),(\w+),(\w+)\)', rhs)
+    if m:
+        a, b, c = m.groups()
+        return _dom(env[a], env[b], env[c])
+    m = re.fullmatch(r'(\w+)([&|^])(\w+)', rhs)
+    if m:
+        a, op, b = m.groups()
+        x, y = env[a], env[b]
+        return _i32(x & y if op == '&' else x | y if op == '|' else x ^ y)
+    m = re.fullmatch(r'~\((\w+)([&|])(\w+)\)', rhs)
+    if m:
+        a, op, b = m.groups()
+        x, y = env[a], env[b]
+        return _i32(~(x & y if op == '&' else x | y))
+    m = re.fullmatch(r'(\w+)\^0x([0-9a-f]+)', rhs)
+    if m:
+        a, c = m.groups()
+        return _i32(env[a] ^ int(c, 16))
+    m = re.fullmatch(r'(\w+)\^\(0x([0-9a-f]+)\)', rhs)
+    if m:
+        a, c = m.groups()
+        return _i32(env[a] ^ int(c, 16))
+    m = re.fullmatch(r'(\w+)', rhs)
+    if m and m.group(1) in env:
+        return env[m.group(1)]
+    raise ValueError('无法求值: ' + rhs)
+
+def _solve_instr(instr_b64):
+    js = zlib.decompress(base64.b64decode(instr_b64), -15).decode('utf-8')
+    nonce = re.search(r"nonce':'([0-9a-f]+)'", js).group(1)
+    vm = re.search(r'var\s+(\w+)=0x([0-9a-f]+),\s*(\w+)=0x([0-9a-f]+),\s*(\w+)=0x([0-9a-f]+),\s*(\w+)=0x([0-9a-f]+);', js)
+    vnames = [vm.group(1), vm.group(3), vm.group(5), vm.group(7)]
+    vals = [int(vm.group(2), 16), int(vm.group(4), 16), int(vm.group(6), 16), int(vm.group(8), 16)]
+    env = dict(zip(vnames, vals))
+    start = vm.end()
+    rv = re.search(r'var\s+(\w+)=\{\};', js[start:])
+    objname = rv.group(1)
+    end = start + rv.start()
+    seg = js[start:end]
+    seg = re.sub(r"navigator\['userAgent'\]\?0x([0-9a-f]+):0x([0-9a-f]+)",
+                 lambda mm: '0x' + mm.group(1), seg)
+    seg = _replace_iife(seg)
+    for stmt in _split_top(seg):
+        if '=' not in stmt: continue
+        lhs, rhs = stmt.split('=', 1)
+        env[lhs.strip()] = _eval_expr(rhs, env)
+    fm = re.search(r"return\s+%s\['([a-z0-9]+)'\]=(\w+),%s\['([a-z0-9]+)'\]=(\w+),%s\['([a-z0-9]+)'\]=(\w+),%s\['([a-z0-9]+)'\]=(\w+),%s" % ((objname,) * 5), js)
+    fnames = [fm.group(1), fm.group(3), fm.group(5), fm.group(7)]
+    fvars = [fm.group(2), fm.group(4), fm.group(6), fm.group(8)]
+    state = {}
+    for fn, fv in zip(fnames, fvars):
+        state[fn] = env[fv]
+    return {"i": nonce, "state": state, "ts": int(time.time() * 1000)}
+
+# ---------------- 单账号注册 (防ban版) ----------------
+RETRY = 2          # 降低重试, 避免被拉黑后还硬刷
+MIN_GAP = 5        # 账号间最小休息秒数
+MAX_GAP = 15       # 防ban随机休息上限 (单账号亦适用)
+
+class _Banned(Exception):
+    """判定 IP 已被风控拉黑, 立即停止整批"""
+    pass
+
+def _is_network_block(ex):
+    msg = str(ex).lower()
+    for kw in ("timed out", "timeout", "connection", "eof", "reset", "refused",
+               "unreachable", "ssl", "broken pipe", "connection aborted",
+               "read timed out", "recv failure"):
+        if kw in msg:
+            return True
+    return False
+
+def _register_one(email, password):
+    last = None
+    for attempt in range(1, RETRY + 1):
+        try:
+            time.sleep(random.uniform(0.5, 2.5))   # 请求抖动
+            s = _new_session()
+            s.headers.update({"User-Agent": _rand_ua(), "referer": BASE + "/",
+                              "origin": BASE, "accept": "application/json"})
+            print("    · 请求验证码...", flush=True)
+            ch = s.post(f"{BASE}/fd0fb2130e/challenge", json={}, timeout=30).json()
+            print(f"    · 计算 PoW (80题, 约10-60秒, 取决于设备)...", flush=True)
+            sols = _solve_challenge(ch)
+            time.sleep(random.uniform(0.5, 1.5))
+            print("    · 生成浏览器指纹...", flush=True)
+            instr = _solve_instr(ch["instrumentation"])
+            print("    · 兑换令牌...", flush=True)
+            r = s.post(f"{BASE}/fd0fb2130e/redeem",
+                       json={"token": ch["token"], "solutions": sols, "instr": instr},
+                       timeout=30)
+            red = r.json()
+            if not red.get("success"):
+                raise RuntimeError(f"redeem 失败: {red}")
+            time.sleep(random.uniform(0.5, 1.5))
+            r = s.post(f"{BASE}/api/v1/passport/auth/register",
+                       data={"email": email, "password": password, "invite_code": "",
+                             "email_code": "", "recaptcha_data": red["token"]}, timeout=30)
+            rj = r.json()
+            data = rj.get("data")
+            if not data:
+                raise RuntimeError(f"注册失败: {rj}")
+            token = data["token"]
+            return {"email": email, "password": password, "token": token,
+                    "auth_data": data.get("auth_data"),
+                    "subscribe_url": f"https://windowsv1.com/s/?token={token}"}
+        except _Banned:
+            raise
+        except Exception as ex:
+            last = ex
+            if _is_network_block(ex):
+                raise _Banned(f"网络被拦截(疑似IP已进风控黑名单): {ex}")
+            if attempt < RETRY:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"重试{RETRY}次均失败: {last}")
+
+def _rand_password(n=12):
+    pools = [string.ascii_lowercase, string.ascii_uppercase, string.digits, "!@#$%"]
+    pw = [random.choice(p) for p in pools]
+    pw += [random.choice(string.ascii_letters + string.digits) for _ in range(n - len(pw))]
+    random.shuffle(pw)
+    return "".join(pw)
+
+def _rand_email():
+    suf = random.choice(SUFFIXES)
+    num = random.randint(1000, 99999999)
+    letters = "".join(random.choice(string.ascii_lowercase) for _ in range(random.randint(3, 7)))
+    return f"{letters}{num}@{suf}"
+
+def _fetch_nodes(token):
+    """用 clash UA 拉订阅, 返回 (yaml_text, 节点URI列表, 原始b64)"""
+    import yaml
+    s = _new_session()
+    s.headers.update({"User-Agent": "clash-verge/v1.3.8", "accept": "*/*",
+                      "referer": BASE + "/"})
+    try:
+        r = s.get(f"https://windowsv1.com/s/?token={token}", timeout=30)
+        yaml_text = r.text
+    except Exception as ex:
+        return None, [], str(ex)
+    uris = []
+    try:
+        cfg = yaml.safe_load(yaml_text)
+        for p in cfg.get("proxies", []):
+            names = p.get("name", "")
+            if "剩余" in names or "到期" in names or "官网" in names or "套餐" in names:
+                continue
+            pwd = str(p.get("password", p.get("uuid", "")))
+            srv = str(p.get("server", ""))
+            port = p.get("port")
+            typ = p.get("type", "")
+            sni = p.get("sni", "")
+            if not srv or srv.startswith("127.") or "$" in names:
+                continue
+            if typ == "hysteria2" or typ == "hysteria":
+                u = f"hy2://{pwd}@{srv}:{port}?sni={sni}&insecure=1#{urllib.parse.quote(names)}"
+            elif typ == "anytls":
+                u = (f"anytls://{pwd}@{srv}:{port}/?type=tcp&insecure=1"
+                     f"&fp={p.get('client-fingerprint','chrome')}&sni={sni}#{urllib.parse.quote(names)}")
+            elif typ == "ss":
+                raw = f"{p.get('cipher','aes-128-gcm')}:{pwd}".encode()
+                u = (f"ss://{base64.b64encode(raw).decode().rstrip('=')}"
+                     f"@{srv}:{port}#{urllib.parse.quote(names)}")
+            elif typ == "vless":
+                u = (f"vless://{pwd}@{srv}:{port}?encryption=none&security=tls"
+                     f"&sni={sni}&fp={p.get('client-fingerprint','chrome')}"
+                     f"&type={p.get('network','tcp')}#{urllib.parse.quote(names)}")
+            elif typ == "trojan":
+                u = f"trojan://{pwd}@{srv}:{port}?sni={sni}&allowInsecure=1#{urllib.parse.quote(names)}"
+            else:
+                u = f"{typ}://{srv}:{port}#{urllib.parse.quote(names)}"
+            uris.append(u)
+    except Exception:
+        pass
+    return yaml_text, uris, None
+
+
+def _save_results(accounts, save_dir, nodes_all):
+    os.makedirs(save_dir, exist_ok=True)
+    txt_path = os.path.join(save_dir, "accounts.txt")
+    json_path = os.path.join(save_dir, "accounts.json")
+    node_path = os.path.join(save_dir, "nodes.txt")
+    node_json_path = os.path.join(save_dir, "nodes.json")
+    clash_path = os.path.join(save_dir, "clash_all.yaml")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("========== 乌拉VPN 批量注册结果 ==========\n")
+        f.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}  成功 {len(accounts)}\n\n")
+        for idx, a in enumerate(accounts, 1):
+            f.write(f"[{idx}] 邮箱: {a['email']}\n")
+            f.write(f"    密码: {a['password']}\n")
+            f.write(f"    订阅: {a.get('subscribe_url', '')}\n")
+            f.write(f"    节点数: {a.get('node_count', 0)}\n\n")
+    # 去重后的节点 URI 列表 (可直接导入所有客户端, 或经订阅转换器生成链接)
+    seen = set()
+    uniq = []
+    for u in nodes_all:
+        body = u.split("#")[0]
+        if body in seen:
+            continue
+        seen.add(body)
+        uniq.append(u)
+    with open(node_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(uniq) + "\n")
+    with open(node_json_path, "w", encoding="utf-8") as f:
+        json.dump([{"uri": u} for u in uniq], f, ensure_ascii=False, indent=2)
+    return txt_path, json_path, node_path, len(uniq)
+
+
+def main():
+    # 简化: 每次只注册 1 个账号 (批量注册功能已移除)
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--password", default=None, help="自定义密码 (默认随机)")
+    ap.add_argument("--proxy", default=None,
+                    help='代理地址, 让脚本和梯子走同一个出口, 例: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080')
+    ap.add_argument("--outdir", default=None,
+                    help='结果保存目录 (默认自动落到手机 Download)')
+    args, _ = ap.parse_known_args()
+
+    if args.proxy is None:
+        args.proxy = os.environ.get("WULA_PROXY") or None
+    if args.proxy:
+        global PROXY
+        PROXY = args.proxy
+        print(f"[*] 已启用代理出口: {args.proxy}\n")
+
+    accounts = []
+    t0 = time.time()
+    stopped = False
+
+    email = _rand_email()
+    pwd = args.password or _rand_password()
+    try:
+        acc = _register_one(email, pwd)
+        accounts.append(acc)
+        print(f"  [1/1] OK  {email}  密码:{pwd}")
+        print(f"        {acc['subscribe_url']}")
+    except _Banned as ex:
+        print(f"\n[!!] {ex}")
+        print("[!!] 疑似 IP 被风控拉黑。请换 IP (手机开飞行模式10秒 / 换梯子节点) 后再试。")
+        stopped = True
+    except Exception as ex:
+        print(f"  [1/1] FAIL {email}  {ex}")
+
+    # 确定结果保存目录 (CI/GitHub 用 --outdir output)
+    if args.outdir:
+        save_dir = os.path.expanduser(args.outdir)
+        if not os.path.isdir(save_dir):
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+            except Exception as _e:
+                print(f"[!] 无法创建目录 {save_dir}: {_e}, 回退到脚本目录")
+                save_dir = os.path.dirname(os.path.abspath(__file__)) or "."
+    else:
+        save_dir = None
+        for cand in ("/sdcard/Download", "/storage/emulated/0/Download",
+                     "/sdcard/下载", "/storage/emulated/0/下载"):
+            if os.path.isdir(cand):
+                save_dir = cand
+                break
+        if save_dir is None:
+            save_dir = os.path.dirname(os.path.abspath(__file__)) or "."
+
+    # ===== 订阅 -> 节点 提取 =====
+    nodes_all = []
+    clash_parts = []
+    if accounts:
+        print(f"\n[*] 开始提取节点 (clash UA 拉取订阅) ...")
+        for idx, a in enumerate(accounts, 1):
+            token = a.get("token") or ""
+            if not token:
+                continue
+            ytext, uris, err = _fetch_nodes(token)
+            if err:
+                print(f"  [{idx}] 订阅拉取失败: {err}")
+                continue
+            a["node_count"] = len(uris)
+            nodes_all.extend(uris)
+            clash_parts.append(ytext)
+            print(f"  [{idx}] {a['email']}: {len(uris)} 个节点")
+
+    txt_path, json_path, node_path, uniq_n = _save_results(accounts, save_dir, nodes_all)
+    if clash_parts:
+        with open(os.path.join(save_dir, "clash_all.yaml"), "w", encoding="utf-8") as f:
+            f.write("\n".join(clash_parts))
+
+    # 明文打印全部结果
+    print("\n" + "=" * 50)
+    print(f"[+] 成功 {len(accounts)} 个账号, 去重后 {uniq_n} 个节点, 用时 {round(time.time()-t0,1)}s")
+    print("=" * 50)
+    for idx, a in enumerate(accounts, 1):
+        print(f"\n[{idx}] 邮箱: {a['email']}")
+        print(f"    订阅: {a.get('subscribe_url', '')}")
+        print(f"    节点: {a.get('node_count', 0)} 个 (已在 {node_path} 去重合并)")
+    if stopped:
+        print(f"\n[!] 本次因疑似 IP 被拉黑而提前停止, 注册未完成。换 IP 后再跑。")
+
+
+if __name__ == "__main__":
+    main()
