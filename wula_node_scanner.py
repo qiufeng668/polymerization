@@ -34,11 +34,14 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 VAULT = os.path.join(HERE, "vault_repo")
 POOL_FILE = os.path.join(VAULT, "wula_pool.json")
+# @interval: 6h  —— 节点池每 6 小时重扫一次，避免在下次更新前失效
+DEFAULT_INTERVAL = 6 * 3600
 PROBE = "https://wula001.com/"
 BASE_PORT = 18000
 PER_NODE_TIMEOUT = 12
 MAX_WORKERS = 16
 CHALLENGE_PATH = "/fd0fb2130e/challenge"
+DEFAULT_BUDGET = 900      # 默认时间预算（秒），到点就停，扫多少算多少
 
 KEEP_TYPES = ("anytls", "vless", "vmess", "trojan", "hysteria2", "ss")
 
@@ -71,6 +74,24 @@ def _quote_strings(obj):
 
 def log(msg):
     print(f"[scanner] {msg}", flush=True)
+
+
+def _pool_age_ok(interval):
+    """池子是否仍在有效期内。返回 (ok, 已过秒数, 总条数)。"""
+    if not os.path.exists(POOL_FILE):
+        return False, 0, 0
+    try:
+        data = json.load(open(POOL_FILE, encoding="utf-8"))
+    except Exception:
+        return False, 0, 0
+    ts = data.get("ts") or 0
+    if not ts:
+        try:
+            ts = os.path.getmtime(POOL_FILE)
+        except Exception:
+            ts = 0
+    age = time.time() - ts if ts else 10 ** 9
+    return age < interval, age, len(data.get("nodes") or {})
 
 
 def find_mihomo():
@@ -135,7 +156,8 @@ def test_node(mihomo, proxy, port, target=PROBE, deep=False):
 
     返回 (ok, verdict)
       deep=False：连接层通过即 ok（拿到任何 HTTP 响应，含 403/404）
-      deep=True ：还要求 challenge 接口返回合法 token（说明没被 wula 风控软拒）
+      deep=True ：打 challenge 接口要 token（能过 WAF）
+      deep=='register'：直接试注册一个账号（最严格，但会消耗邮箱）
     """
     cfg = {
         "mixed-port": port,
@@ -214,8 +236,14 @@ def test_node(mihomo, proxy, port, target=PROBE, deep=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=120, help="最多扫描几条（默认120）")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="最多扫描几条（0=全部，默认全部）")
     ap.add_argument("--workers", type=int, default=MAX_WORKERS)
+    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                    help="时间预算秒数，到点停止（默认900，0=不限）")
+    ap.add_argument("--interval", type=float, default=6,
+                    help="最小扫描间隔（小时，默认6；0=每次必扫）")
+    ap.add_argument("--force", action="store_true", help="强制重扫（忽略间隔）")
     ap.add_argument("--list", action="store_true", help="只列当前池子")
     ap.add_argument("--target", default=PROBE, help="探测目标 URL")
     ap.add_argument("--deep", action="store_true",
@@ -237,6 +265,15 @@ def main():
             log("池子文件不存在")
         return 0
 
+    # 定时机制：池子未过期且不为空时直接跳过（--force 可强制重扫）
+    interval = args.interval * 3600 if args.interval > 0 else DEFAULT_INTERVAL
+    if not args.force:
+        fresh, age, cnt = _pool_age_ok(interval)
+        if fresh and cnt > 0:
+            log(f"⏭️ 池子仍有效（{cnt} 条，{age/3600:.1f}h 前扫的，"
+                f"间隔 {interval//3600}h），跳过本轮。--force 可强制重扫")
+            return 0
+
     mihomo = find_mihomo()
     if not mihomo:
         log("❌ 找不到 mihomo 二进制")
@@ -256,18 +293,24 @@ def main():
         except Exception:
             pass
 
-    candidates = pool[:args.limit]
-    log(f"待扫描 {len(candidates)} 条，并发 {args.workers}，目标 {args.target}")
+    candidates = pool if args.limit <= 0 else pool[:args.limit]
+    log(f"待扫描 {len(candidates)}/{len(pool)} 条，并发 {args.workers}，"
+        f"预算 {args.budget}s，目标 {args.target}")
 
     good = {}
     lock = threading.Lock()
     t0 = time.time()
+    deadline = (t0 + args.budget) if args.budget > 0 else None
+    scanned_count = [0]
 
     def worker(idx_proxy):
         idx, proxy = idx_proxy
+        if deadline and time.time() > deadline:
+            return False
         port = BASE_PORT + (idx % 500)
         ok, verdict = test_node(mihomo, proxy, port, args.target, args.deep)
         with lock:
+            scanned_count[0] += 1
             mark = "✅" if ok else "❌"
             print(f"  {mark} [{idx:3d}] {verdict:10s} {proxy['name'][:46]}", flush=True)
             if ok:
@@ -286,16 +329,19 @@ def main():
     # 出口 IP（用第一个可用节点确认）
     out = {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": int(time.time()),
         "target": args.target,
         "deep": bool(args.deep),
-        "scanned": len(candidates),
+        "scanned": scanned_count[0],
+        "candidates": len(candidates),
+        "budget_hit": bool(deadline and time.time() > deadline),
         "alive": len(good),
         "nodes": merged,
     }
     with open(POOL_FILE, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
 
-    log(f"扫描完成: {len(good)}/{len(candidates)} 可用，用时 {elapsed:.0f}s")
+    log(f"扫描完成: {len(good)}/{scanned_count[0]} 可用（候选 {len(candidates)}），用时 {elapsed:.0f}s")
     log(f"已写入 {POOL_FILE}（累计 {len(merged)} 条）")
     return 0 if good else 2
 
