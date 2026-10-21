@@ -1,75 +1,28 @@
-name: Auto Multi-Sub Aggregator
-
+name: Wula origin study v2
 on:
-  schedule:
-    - cron: '*/50 * * * *'
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
-  build-and-sync:
+  study:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 10
     steps:
-      - name: 1. 检出公开库代码
-        uses: actions/checkout@v4
-
-      - name: 2. 🔐 官方原生检出私有库 (100% 防踩坑认证)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/polymerization-1
           token: ${{ secrets.GIT_TOKEN }}
           path: vault_repo
-
-      - name: 3. 🐍 配置 Python 环境并安装依赖
-        uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: |
-          pip install -r requirements.txt
-
-      - name: 4. ⚡ 下载真连接测速内核 (LiteSpeedTest) + 自举代理内核 (mihomo)
+      - run: python -m pip install requests pyyaml
+      - name: Download one proxy core
         run: |
-          wget -q -O lite.gz https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz
-          gunzip -f lite.gz
-          chmod +x lite
-          # mihomo 用于给被机房 IP 拉黑的插件（如 wula）做自举出口
-          MI_VER="v1.19.32"
-          wget -q -O mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MI_VER}/mihomo-linux-amd64-compatible-${MI_VER}.gz" \
-            && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
-            && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
-
-      - name: 4.5 🎯 扫描可用节点（定时 6h，留 wula 用，不影响其它插件）
-        run: |
-          # 内置 @interval: 6h —— 池子未过期自动跳过；过期才重扫
-          # --budget 兜住单次时长，超时保存已完成的结果
-          python3 wula_node_scanner.py --deep --workers 20 --budget 900 || echo "⚠️ 节点扫描无结果"
-          python3 wula_node_scanner.py --list
-
-      - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
-        env:
-          PYTHONUNBUFFERED: "1"
-          # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
-          MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
-          WULA_MAX_ATTEMPTS: "16"
-        run: |
-          echo "🎯 节点池状态:"
-          python3 wula_node_scanner.py --list || true
-          python -u main_engine.py
-
-      - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
-        run: |
-          cd vault_repo
-          git config user.name "AggregatorBot"
-          git config user.email "bot@noreply.github.com"
-          
-          # 创建一个没有任何历史记录的全新孤儿分支（完美替代之前的 rm -rf .git）
-          git checkout --orphan new_main
-          git add .
-          NODE_COUNT=$(wc -l < nodes_plain.txt 2>/dev/null | tr -d ' ' || echo "0")
-          git commit -m "Auto sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC') (存活: ${NODE_COUNT} 条)" || exit 0
-          
-          echo "📦 正在向私有库推送最新节点..."
-          # 直接利用官方配置好的安全通道强推，再也不用手动拼写 Token！
-          git push -f origin new_main:main
-          echo "🎉 推送完成！"
+          curl -fsSL --max-time 40 -o /tmp/mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-compatible-v1.19.32.gz
+          gunzip /tmp/mihomo.gz
+          chmod +x /tmp/mihomo
+          sudo mv /tmp/mihomo /usr/local/bin/mihomo
+      - run: python -u wula_origin_v2.py
