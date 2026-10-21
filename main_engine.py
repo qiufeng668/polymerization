@@ -843,6 +843,19 @@ def run_plugins_with_cache():
 
     now = int(time.time())
     py_files = sorted(glob.glob(os.path.join(PLUGIN_DIR, "*.py")))
+    # 需要独占代理出口的插件排到最后（避免影响其它插件直连）。
+    # 文件名以 _ 结尾（如 wula_.py）或配置在 LATE_RUN_PLUGINS 里 → 最后跑；
+    # 没列进去的新插件默认按名字排在正常队列，绝不会被插到代理插件后面。
+    _LATE_MARK = "_proxy."          # 文件名含此片段 → 最后执行
+    _LATE_EXPLICIT = tuple(
+        n.strip() for n in os.environ.get("LATE_RUN_PLUGINS", "wula.py").split(",") if n.strip()
+    )
+
+    def _is_late(p):
+        b = os.path.basename(p)
+        return b in _LATE_EXPLICIT or _LATE_MARK in b
+
+    py_files.sort(key=lambda p: (_is_late(p), os.path.basename(p)))
     active_script_names = {os.path.basename(p) for p in py_files}
 
     for old_key in list(state.keys()):
