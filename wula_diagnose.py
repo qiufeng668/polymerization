@@ -58,6 +58,35 @@ def main():
             alive=main_engine.speedtest_modern_nodes(nodes)
             print('subscription modern HTTPS verified',len(alive) if alive is not None else None,flush=True)
             break
+    original_getaddrinfo=socket.getaddrinfo
+    for edge in ('104.21.1.1','172.67.1.1','104.16.132.229'):
+        def route(host,port,*args,**kwargs):
+            return original_getaddrinfo(edge if host in ('wula001.com','windowsv1.com') else host,port,*args,**kwargs)
+        socket.getaddrinfo=route
+        edge_ok=False
+        with requests.Session() as s:
+            s.trust_env=False
+            s.headers.update({'User-Agent':w._UAS[0],'referer':w.BASE+'/','origin':w.BASE})
+            try:
+                r=s.post(w.BASE+'/fd0fb2130e/challenge',json={},timeout=(5,10))
+                j=r.json()
+                edge_ok=bool(r.ok and isinstance(j,dict) and j.get('token') and j.get('challenge') and j.get('instrumentation'))
+                print('EDGE',edge,'challenge',r.status_code,'complete',edge_ok,flush=True)
+            except Exception as ex:
+                print('EDGE',edge,'challenge',type(ex).__name__,flush=True)
+            edge_nodes=0
+            if bank:
+                try:
+                    r=s.get('https://windowsv1.com/s/',params={'token':bank[0]['token']},headers={'User-Agent':'clash-verge/v1.3.8'},timeout=(5,10))
+                    cfg=__import__('yaml').safe_load(r.text)
+                    edge_nodes=len(cfg.get('proxies',[])) if isinstance(cfg,dict) else 0
+                    print('EDGE',edge,'subscription',r.status_code,'config rows',edge_nodes,flush=True)
+                except Exception as ex:
+                    print('EDGE',edge,'subscription',type(ex).__name__,flush=True)
+            if edge_ok and edge_nodes:
+                summary.update({'edge':edge,'edge_challenge':True,'edge_subscription_rows':edge_nodes})
+                break
+    socket.getaddrinfo=original_getaddrinfo
     print('DIAG_SUMMARY',json.dumps(summary),flush=True)
 
 if __name__=='__main__':
