@@ -39,26 +39,24 @@ jobs:
             && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
             && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
 
-      - name: 4.5 🔌 自举代理 (把机房 IP 换成真实节点出口)
+      - name: 4.5 🔌 自举代理 + 🎯 扫描可用节点
         run: |
-          # vault_repo/clash.yaml 是上次跑出来的节点池（第2步已 checkout）
-          # 启动失败不阻断流程，插件会自动回退直连
-          python3 boot_proxy.py || echo "⚠️ 自举代理未就绪，插件将直连"
-          cat /tmp/boot_proxy_url 2>/dev/null || true
+          # 1) 先起个基础代理（给扫描器用，也作为 wula 最后的兜底）
+          python3 boot_proxy.py || echo "⚠️ 基础代理未就绪"
+          # 2) 深扫：挑出真正能通过 wula 风控的节点，写进 vault_repo/wula_pool.json
+          python3 wula_node_scanner.py --limit 80 --workers 16 --deep || echo "⚠️ 节点扫描无结果"
+          # 3) 结果展示（会随第 6 步推送到私有库，下次直接复用）
+          python3 wula_node_scanner.py --list
 
       - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
         env:
           PYTHONUNBUFFERED: "1"
           # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
           MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
+          WULA_MAX_ATTEMPTS: "16"
         run: |
-          # 自举代理就绪则把插件出口指过去（wula 等被机房 IP 拉黑的插件靠这个）
-          if [ -f /tmp/boot_proxy_url ]; then
-            export WULA_PROXY="$(cat /tmp/boot_proxy_url)"
-            echo "🔌 插件出口: $WULA_PROXY"
-          else
-            echo "⚠️ 无自举代理，插件直连（机房 IP）"
-          fi
+          echo "🎯 节点池状态:"
+          python3 wula_node_scanner.py --list || true
           python -u main_engine.py
 
       - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
