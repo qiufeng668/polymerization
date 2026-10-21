@@ -266,8 +266,7 @@ def _register_one(email, password):
     last = None
     for attempt in range(1, RETRY + 1):
         try:
-            time.sleep(random.uniform(0.5, 2.5))   
-# 请求抖动
+            time.sleep(random.uniform(0.5, 2.5))   # 请求抖动
             s = _new_session()
             s.headers.update({"User-Agent": _rand_ua(), "referer": BASE + "/",
                               "origin": BASE, "accept": "application/json"})
@@ -378,7 +377,7 @@ def _save_results(accounts, save_dir, nodes_all):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(accounts, f, ensure_ascii=False, indent=2)
     with open(txt_path, "w", encoding="utf-8") as f:
-f.write("========== 乌拉VPN 批量注册结果 ==========\n")
+        f.write("========== 乌拉VPN 批量注册结果 ==========\n")
         f.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}  成功 {len(accounts)}\n\n")
         for idx, a in enumerate(accounts, 1):
             f.write(f"[{idx}] 邮箱: {a['email']}\n")
