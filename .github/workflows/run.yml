@@ -39,13 +39,11 @@ jobs:
             && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
             && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
 
-      - name: 4.5 🔌 自举代理 + 🎯 扫描可用节点
+      - name: 4.5 🎯 扫描可用节点（定时 6h，留 wula 用，不影响其它插件）
         run: |
-          # 1) 先起个基础代理（给扫描器用，也作为 wula 最后的兜底）
-          python3 boot_proxy.py || echo "⚠️ 基础代理未就绪"
-          # 2) 深扫：挑出真正能通过 wula 风控的节点，写进 vault_repo/wula_pool.json
-          python3 wula_node_scanner.py --limit 80 --workers 16 --deep || echo "⚠️ 节点扫描无结果"
-          # 3) 结果展示（会随第 6 步推送到私有库，下次直接复用）
+          # 内置 @interval: 6h —— 池子未过期自动跳过；过期才重扫
+          # --budget 兜住单次时长，超时保存已完成的结果
+          python3 wula_node_scanner.py --deep --workers 20 --budget 900 || echo "⚠️ 节点扫描无结果"
           python3 wula_node_scanner.py --list
 
       - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
