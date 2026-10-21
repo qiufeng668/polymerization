@@ -76,6 +76,41 @@ def log(msg):
     print(f"[scanner] {msg}", flush=True)
 
 
+# ---------- 出口IP烧名单（与 plugins/wula.py 同格式、同位置 vault_repo/wula_burn.json） ----------
+BURN_DECAY_H = int(os.environ.get("WULA_BURN_DECAY_H", "24"))
+
+
+def _burn_path():
+    return os.path.join(VAULT, "wula_burn.json")
+
+
+def _load_burn():
+    try:
+        with open(_burn_path(), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def mark_burn(egress, why=""):
+    """出口 IP 在 deep 测试网络层失败 → 记入烧名单（wula 在 24h 内跳过该出口）。"""
+    if not egress:
+        return
+    with threading.Lock():
+        b = _load_burn()
+        v = b.get(egress) or {"ts": 0, "fails": 0}
+        v["fails"] = int(v.get("fails", 0)) + 1
+        v["ts"] = time.time()
+        if why:
+            v["last_err"] = str(why)[:80]
+        b[egress] = v
+        try:
+            with open(_burn_path(), "w", encoding="utf-8") as f:
+                json.dump(b, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            log(f"烧名单落盘失败: {e}")
+
+
 def _pool_age_ok(interval):
     """池子是否仍在有效期内。返回 (ok, 已过秒数, 总条数)。"""
     if not os.path.exists(POOL_FILE):
@@ -152,21 +187,22 @@ def load_pool():
 
 
 def test_node(mihomo, proxy, port, target=PROBE, deep=False):
-    """单节点测试：起独立 mihomo，试连 target。
+    """单节点测试：起独立 mihomo，探出口IP，试连 target。
 
-    返回 (ok, verdict)
+    返回 (ok, verdict, egress)
+      egress: 该节点出口 IP（探测失败为 None）——写进池子供 wula 做烧名单
       deep=False：连接层通过即 ok（拿到任何 HTTP 响应，含 403/404）
       deep=True ：打 challenge 接口要 token（能过 WAF）
-      deep=='register'：直接试注册一个账号（最严格，但会消耗邮箱）
     """
+    p_node = {k: v for k, v in proxy.items() if k not in ("egress", "exit_ip")}
     cfg = {
         "mixed-port": port,
         "allow-lan": False,
         "bind-address": "127.0.0.1",
         "mode": "rule",
         "log-level": "silent",
-        "proxies": [proxy],
-        "proxy-groups": [{"name": "G", "type": "select", "proxies": [proxy["name"]]}],
+        "proxies": [p_node],
+        "proxy-groups": [{"name": "G", "type": "select", "proxies": [p_node["name"]]}],
         "rules": ["MATCH,G"],
     }
     fd, conf_path = tempfile.mkstemp(suffix=".yaml", prefix="wscan_")
@@ -185,6 +221,13 @@ def test_node(mihomo, proxy, port, target=PROBE, deep=False):
                 "http": f"http://127.0.0.1:{port}",
                 "https": f"http://127.0.0.1:{port}",
             }))
+            # 先探出口 IP（wula 侧烧名单按出口 IP 粒度，池子也要标注）
+            egress = None
+            try:
+                with opener.open("https://api.ipify.org", timeout=PER_NODE_TIMEOUT) as r:
+                    egress = (r.read(64).decode().strip() or None)
+            except Exception:
+                egress = None
             if deep:
                 # 深测：直接打 wula 的 challenge 接口，看是否被风控软拒
                 base = target.rstrip("/") if target.startswith("http") else PROBE.rstrip("/")
@@ -200,24 +243,24 @@ def test_node(mihomo, proxy, port, target=PROBE, deep=False):
                         body = r.read(4000)
                     j = json.loads(body.decode("utf-8", "ignore"))
                     if j.get("token") and j.get("challenge"):
-                        return True, "CHAL-OK"
-                    return False, "CHAL-BAD"
+                        return True, "CHAL-OK", egress
+                    return False, "CHAL-BAD", egress
                 except urllib.error.HTTPError as e:
-                    return False, f"CHAL-HTTP{e.code}"
+                    return False, f"CHAL-HTTP{e.code}", egress
                 except Exception as e:
-                    return False, f"CHAL-{type(e).__name__}"
+                    return False, f"CHAL-{type(e).__name__}", egress
             try:
                 r = opener.open(target, timeout=PER_NODE_TIMEOUT)
                 try:
                     r.read(128)
                 except Exception:
                     pass
-                return True, f"HTTP{r.status}"
+                return True, f"HTTP{r.status}", egress
             except urllib.error.HTTPError as e:
                 # 拿到 HTTP 响应 = 连接层通（403 WAF 也算节点可达）
-                return True, f"HTTP{e.code}"
+                return True, f"HTTP{e.code}", egress
             except Exception as e:
-                return False, type(e).__name__
+                return False, type(e).__name__, egress
         finally:
             try:
                 proc.terminate()
@@ -308,13 +351,20 @@ def main():
         if deadline and time.time() > deadline:
             return False
         port = BASE_PORT + (idx % 500)
-        ok, verdict = test_node(mihomo, proxy, port, args.target, args.deep)
+        ok, verdict, egress = test_node(mihomo, proxy, port, args.target, args.deep)
         with lock:
             scanned_count[0] += 1
             mark = "✅" if ok else "❌"
-            print(f"  {mark} [{idx:3d}] {verdict:10s} {proxy['name'][:46]}", flush=True)
-            if ok:
-                good[proxy["name"]] = proxy
+            eg_txt = f" 出口{egress}" if egress else ""
+            print(f"  {mark} [{idx:3d}] {verdict:10s} {proxy['name'][:42]}{eg_txt}", flush=True)
+        if ok:
+            with lock:
+                good[proxy["name"]] = {**proxy, "egress": egress}
+        elif (args.deep and egress and verdict.startswith("CHAL-")
+              and not verdict.startswith("CHAL-BAD")
+              and not verdict.startswith("CHAL-HTTP")):
+            # challenge 在网络层挂掉 = 这个出口在 wula 那里不受欢迎（或节点死）→ 烧名单
+            mark_burn(egress, verdict)
         return ok
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
