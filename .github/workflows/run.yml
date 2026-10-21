@@ -28,6 +28,7 @@ jobs:
       - name: Neutral HTTPS versus Wula on identical outbound
         run: python -u wula_egress_probe.py
   warp:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:

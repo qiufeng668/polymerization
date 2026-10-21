@@ -13,6 +13,14 @@ CONTROL='https://www.gstatic.com/generate_204'
 API='http://127.0.0.1:19090'
 PROXY='http://127.0.0.1:18980'
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+REGION_HINT={}
+SEEN_EXITS=set()
+COUNTRY_TESTED=collections.Counter()
+
+def region_hint(name):
+    for code,pattern in [('JP',r'日本|东京|大阪|🇯🇵|\bJP\b|Japan'),('HK',r'香港|🇭🇰|\bHK\b|Hong.?Kong'),('SG',r'新加坡|狮城|🇸🇬|\bSG\b|Singapore'),('TW',r'台湾|台灣|🇹🇼|\bTW\b|Taiwan'),('KR',r'韩国|韓國|🇰🇷|\bKR\b|Korea'),('US',r'美国|美國|🇺🇸|\bUS\b|United States')]:
+        if re.search(pattern,str(name),re.I):return code
+    return 'OTHER'
 
 def emit(kind,**data):
     print(kind,json.dumps(data,ensure_ascii=False),flush=True)
@@ -76,6 +84,7 @@ def load_nodes():
         if fingerprint in seen:continue
         seen.add(fingerprint)
         node['name']='p'+str(len(unique)).zfill(4)
+        REGION_HINT[node['name']]=region_hint(raw.get('name',''))
         unique.append(node)
     emit('POOL',count=len(unique),types=dict(collections.Counter(x['type'] for x in unique)))
     return unique
@@ -117,6 +126,17 @@ def target_probe(node,bank):
         emit('CONTROL',node=name,type=kind,status=r.status_code)
         if r.status_code!=204:return False
     except Exception as e:emit('CONTROL',node=name,type=kind,error=type(e).__name__);return False
+    try:
+        r=session.get('https://www.cloudflare.com/cdn-cgi/trace',timeout=(3,5))
+        trace=dict(x.split('=',1) for x in r.text.splitlines() if '=' in x)
+        country=trace.get('loc','UNKNOWN')
+        exit_hash=hashlib.sha256(trace.get('ip','').encode()).hexdigest()[:12]
+        emit('REGION',node=name,hint=REGION_HINT.get(name),country=country,exit_hash=exit_hash)
+        if exit_hash in SEEN_EXITS or COUNTRY_TESTED[country]>=3:
+            emit('REGION_SKIP',node=name,reason='duplicate or country quota')
+            return False
+        SEEN_EXITS.add(exit_hash);COUNTRY_TESTED[country]+=1
+    except Exception as e:emit('REGION',node=name,error=type(e).__name__)
     for host in ('wula001.com','wulass.org'):
         try:
             r=session.post('https://'+host+'/fd0fb2130e/challenge',json={},timeout=(4,7))
@@ -137,7 +157,7 @@ def target_probe(node,bank):
         emit('EGRESS',node=name,country=trace.get('loc'),exit_hash=hashlib.sha256(trace.get('ip','').encode()).hexdigest()[:12],warp=trace.get('warp'))
     except Exception as e:emit('EGRESS',node=name,error=type(e).__name__)
     # SOCKS5 local resolution honors RESOLVE while keeping origin Host and TLS SNI.
-    for edge in (None,'20.46.182.213','104.21.1.1','104.16.132.229'):
+    for edge in (None,'104.21.1.1'):
         try:
             host='wula001.com'
             options={CurlOpt.RESOLVE:[f'{host}:443:{edge}']} if edge else {}
@@ -180,9 +200,16 @@ def main():
                     if done%60==0:emit('PROGRESS',tested=done,neutral_alive=len(alive),seconds=round(time.monotonic()-START,1))
             alive.sort(key=lambda x:x[0])
             emit('NEUTRAL_RESULT',tested=done,alive=len(alive),types=dict(collections.Counter(n['type'] for _,n in alive)))
+            emit('REGION_HINTS',counts=dict(collections.Counter(REGION_HINT.get(n['name'],'OTHER') for _,n in alive)))
+            buckets={code:[] for code in ('JP','HK','SG','TW','KR','OTHER','US')}
+            for item in alive:buckets[REGION_HINT.get(item[1]['name'],'OTHER')].append(item)
+            selected=[]
+            for index in range(10):
+                for code in buckets:
+                    if index<len(buckets[code]):selected.append(buckets[code][index])
             working=False;tested=0
-            for latency,node in alive[:6]:
-                if time.monotonic()-START>BUDGET-40:break
+            for latency,node in selected:
+                if time.monotonic()-START>BUDGET-45:break
                 tested+=1;emit('TRY_ROUTE',node=node['name'],type=node['type'],latency=latency)
                 if target_probe(node,bank):working=True;break
             emit('RESULT',working=working,target_tested=tested,neutral_alive=len(alive),seconds=round(time.monotonic()-START,1))
