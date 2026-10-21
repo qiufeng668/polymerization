@@ -130,17 +130,26 @@ def target_probe(node,bank):
                     except Exception as e:emit('SUBSCRIPTION',node=name,error=type(e).__name__)
                 emit('WORKING_ROUTE',node=name,type=kind,host=host)
                 return True
-        except Exception as e:emit('TARGET',node=name,host=host,transport='requests',error=type(e).__name__)
-    # Same egress, browser TLS; never change egress halfway through a proof.
+        except Exception as e:emit('TARGET',node=name,host=host,transport='requests',error=type(e).__name__,detail=str(e)[:240])
     try:
-        with cr.Session(impersonate='chrome131',proxy=PROXY,trust_env=False) as chrome:
-            chrome.headers.update({'Origin':'https://wula001.com','Referer':'https://wula001.com/'})
-            r=chrome.post('https://wula001.com/fd0fb2130e/challenge',json={},timeout=(4,7))
-            result=response_summary(r);emit('TARGET',node=name,host='wula001.com',transport='chrome131',**result)
-            if result['complete']:
-                emit('WORKING_ROUTE',node=name,type=kind,host='wula001.com',chrome=True)
-                return True
-    except Exception as e:emit('TARGET',node=name,transport='chrome131',error=type(e).__name__)
+        r=session.get('https://www.cloudflare.com/cdn-cgi/trace',timeout=(3,5))
+        trace=dict(x.split('=',1) for x in r.text.splitlines() if '=' in x)
+        emit('EGRESS',node=name,country=trace.get('loc'),exit_hash=hashlib.sha256(trace.get('ip','').encode()).hexdigest()[:12],warp=trace.get('warp'))
+    except Exception as e:emit('EGRESS',node=name,error=type(e).__name__)
+    # SOCKS5 local resolution honors RESOLVE while keeping origin Host and TLS SNI.
+    for edge in (None,'20.46.182.213','104.21.1.1','104.16.132.229'):
+        try:
+            host='wula001.com'
+            options={CurlOpt.RESOLVE:[f'{host}:443:{edge}']} if edge else {}
+            proxy='socks5://127.0.0.1:18980' if edge else 'socks5h://127.0.0.1:18980'
+            with cr.Session(impersonate='chrome131',proxy=proxy,trust_env=False,curl_options=options) as chrome:
+                chrome.headers.update({'Origin':'https://'+host,'Referer':'https://'+host+'/'})
+                r=chrome.post('https://'+host+'/fd0fb2130e/challenge',json={},timeout=(4,7))
+                result=response_summary(r);emit('ROUTED_TARGET',node=name,route=edge or 'remote-dns',**result)
+                if result['complete']:
+                    emit('WORKING_ROUTE',node=name,type=kind,host=host,route=edge or 'remote-dns')
+                    return True
+        except Exception as e:emit('ROUTED_TARGET',node=name,route=edge or 'remote-dns',error=type(e).__name__,detail=str(e)[:240])
     return False
 
 def main():
@@ -172,7 +181,7 @@ def main():
             alive.sort(key=lambda x:x[0])
             emit('NEUTRAL_RESULT',tested=done,alive=len(alive),types=dict(collections.Counter(n['type'] for _,n in alive)))
             working=False;tested=0
-            for latency,node in alive[:18]:
+            for latency,node in alive[:6]:
                 if time.monotonic()-START>BUDGET-40:break
                 tested+=1;emit('TRY_ROUTE',node=node['name'],type=node['type'],latency=latency)
                 if target_probe(node,bank):working=True;break
