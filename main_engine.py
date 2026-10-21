@@ -359,6 +359,7 @@ def uri_to_clash_proxy(uri):
                 "password": userinfo, "udp": True, "skip-cert-verify": True
             }
             if q.get("sni"): proxy["sni"] = q["sni"]
+            if q.get("alpn"): proxy["alpn"] = q["alpn"].split(",")
             if q.get("obfs"):
                 ob = str(q["obfs"]).strip()
                 if ob.startswith("{"):          # safevpn 系把整个 dict 字符串塞进 URI
@@ -392,6 +393,7 @@ def uri_to_clash_proxy(uri):
             }
             if q.get("sni"): proxy["sni"] = q["sni"]
             if q.get("fp"): proxy["client-fingerprint"] = q["fp"]
+            if q.get("alpn"): proxy["alpn"] = q["alpn"].split(",")
             return proxy
 
         elif scheme == "ss":
@@ -879,6 +881,13 @@ def run_plugins_with_cache():
             cached_nodes = [apply_source_prefix(u, _tag) for u in cached_nodes]
         fail_count = info.get("fail_count", 0)
         elapsed = now - last_run
+        selected = {n.strip() for n in os.environ.get("ONLY_PLUGINS", "").split(",") if n.strip()}
+        if selected and script_name not in selected:
+            all_raw_nodes.extend(cached_nodes)
+            plugin_reports.append({"name": script_name, "interval": format_interval(interval_sec),
+                                   "status": "⏭️ 定向验证：沿用缓存", "count": len(cached_nodes),
+                                   "fail_count": fail_count, "advice": "未执行，保留缓存"})
+            continue
 
         if manual_force or elapsed + 180 >= interval_sec or not cached_nodes:
             print(f"🚀 [执行] {script_name} (设定间隔: {format_interval(interval_sec)}, 历史连续失败: {fail_count}次)")
@@ -887,7 +896,13 @@ def run_plugins_with_cache():
             shutil.copy(py_path, os.path.join(SANDBOX_DIR, script_name))
             
             try:
-                proc = subprocess.run(["python", script_name], cwd=SANDBOX_DIR, capture_output=False, text=True, timeout=600)
+                plugin_command = ["python", script_name]
+                if script_name == "wula.py":
+                    # Android 也必须写在沙箱内，否则主控采集不到 Download 中的结果。
+                    plugin_command += ["--outdir", "output"]
+                proc = subprocess.run(plugin_command, cwd=SANDBOX_DIR, capture_output=False, text=True, timeout=600)
+                if proc.returncode:
+                    print(f"   ⚠️ {script_name} 退出码: {proc.returncode}")
                 extracted = []
                 for root, _, files in os.walk(SANDBOX_DIR):
                     for file in files:
@@ -970,6 +985,91 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
     else: print("✅ 【脚本健康】 所有启用中的脚本状态均正常！")
     print("=" * 60 + "\n")
 
+def speedtest_modern_nodes(nodes):
+    """LiteSpeedTest v0.15 不支持 AnyTLS/HY2；用 mihomo delay API 实测 HTTPS 转发。
+
+    None 表示缺少/启动不了支持内核；[] 表示完成测速但没有可用节点。
+    """
+    if not nodes:
+        return []
+    import socket
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    import requests
+    binary = shutil.which("mihomo")
+    if not binary:
+        print("⚠️ AnyTLS/HY2 未测速：缺少 mihomo")
+        return None
+    proxies, mapping = [], {}
+    for index, uri in enumerate(nodes):
+        p = uri_to_clash_proxy(uri)
+        if p:
+            name = f"probe-{index}"
+            p["name"] = name
+            proxies.append(p)
+            mapping[name] = uri
+    if not proxies:
+        return []
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with tempfile.TemporaryDirectory(prefix="modern_probe_") as tmp:
+        config = {"external-controller": f"127.0.0.1:{port}", "allow-lan": False,
+                  "mode": "rule", "log-level": "silent", "proxies": proxies,
+                  "rules": ["MATCH,REJECT"]}
+        path = os.path.join(tmp, "config.yaml")
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(_quote_all(config), f, allow_unicode=True)
+        try:
+            proc = subprocess.Popen([binary, "-d", tmp, "-f", path],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            print("⚠️ AnyTLS/HY2 未测速：mihomo 启动失败")
+            return None
+        try:
+            root = f"http://127.0.0.1:{port}"
+            with requests.Session() as session:
+                session.trust_env = False
+                ready = False
+                for _ in range(40):
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        ready = session.get(root + "/version", timeout=0.2).ok
+                        if ready:
+                            break
+                    except requests.RequestException:
+                        pass
+                    time.sleep(0.1)
+            if not ready:
+                print("⚠️ AnyTLS/HY2 未测速：mihomo controller 不可达")
+                return None
+            def probe(name):
+                try:
+                    with requests.Session() as session:
+                        session.trust_env = False
+                        r = session.get(root + "/proxies/" + name + "/delay",
+                                        params={"url": "https://cp.cloudflare.com/generate_204", "timeout": 8000},
+                                        timeout=10)
+                        r.raise_for_status()
+                        delay = r.json().get("delay")
+                        if isinstance(delay, (int, float)) and 0 < delay <= MAX_LATENCY_MS:
+                            return delay, mapping[name]
+                except (requests.RequestException, ValueError):
+                    pass
+                return None
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                hits = [result for result in executor.map(probe, mapping) if result is not None]
+            print(f"✅ mihomo HTTPS 实测 AnyTLS/HY2：{len(hits)}/{len(nodes)} 条可用")
+            return [uri for delay, uri in sorted(hits)]
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
 def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     unique_map = {}
     for uri in raw_nodes:
@@ -983,10 +1083,14 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
         generate_dashboard(len(raw_nodes), 0, 0, 0, {}, plugin_reports)
         return
 
-    with open(PRE_TEST_FILE, "w", encoding="utf-8") as f: f.write("\n".join(unique_nodes))
+    modern_schemes = ("anytls://", "hy2://", "hysteria2://")
+    modern_nodes = [u for u in unique_nodes if u.startswith(modern_schemes)]
+    lite_nodes = [u for u in unique_nodes if not u.startswith(modern_schemes)]
+    modern_alive = speedtest_modern_nodes(modern_nodes)
+    with open(PRE_TEST_FILE, "w", encoding="utf-8") as f: f.write("\n".join(lite_nodes))
 
     alive_nodes = []
-    if os.path.exists("./lite"):
+    if lite_nodes and os.path.exists("./lite"):
         print("⚡ 启动内核级真连接测速 (通过 Cloudflare generate_204 验证真实转发)...")
         # 用 googleping：lite 内部走 https://cp.cloudflare.com/generate_204 测【真实代理转发】，
         # 而不是 tcping（只测端口开，会把"端口开但代理已失效"的假活节点混进来）。
@@ -1031,7 +1135,7 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
             # 静态 IP 节点优先：ip 直连比动态域名(vip/3dns等)稳；再按延迟低→高
             _STATIC_RE = __import__("re").compile(r"^\d+\.\d+\.\d+\.\d+$")
             def _rank(idx):
-                uri = unique_nodes[idx] if 0 <= idx < len(unique_nodes) else ""
+                uri = lite_nodes[idx] if 0 <= idx < len(lite_nodes) else ""
                 host = ""
                 if "://" in uri:
                     try:
@@ -1044,17 +1148,22 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
             print(f"✅ 存活节点 {len(valid_ids)} 个（阈值≤{MAX_LATENCY_MS}ms + 静态IP优先）")
 
             for idx in valid_ids:
-                if 0 <= idx < len(unique_nodes):
-                    alive_nodes.append(unique_nodes[idx])
+                if 0 <= idx < len(lite_nodes):
+                    alive_nodes.append(lite_nodes[idx])
 
         except Exception as e:
             print(f"⚠️ 测速组件运行或解析异常: {e}")
 
-    if not alive_nodes:
-        print("ℹ️ 测速过滤后无节点存活，将降级使用去重列表保底...")
-        alive_nodes = unique_nodes
+    if modern_alive is None:
+        print("⚠️ 缺少可用的现代协议测速内核，保留 AnyTLS/HY2，但不宣称已实测")
+        alive_nodes.extend(modern_nodes)
     else:
-        print(f"🎯 真连接测速完成！精准拦截死节点，存活真节点: {len(alive_nodes)} / {len(unique_nodes)} 条")
+        alive_nodes.extend(modern_alive)
+    if not alive_nodes:
+        print("⚠️ 测速无存活；仅沿用旧协议原有兜底，不把已实测失败的 AnyTLS/HY2 重新加回")
+        alive_nodes = lite_nodes
+    else:
+        print(f"🎯 测速筛选完成，保留 {len(alive_nodes)} / {len(unique_nodes)} 条")
 
     region_counters, final_nodes = {}, []
     for uri in alive_nodes:
@@ -1083,6 +1192,8 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
             except Exception: pass
 
     generate_dashboard(len(raw_nodes), len(unique_nodes), len(final_nodes), clash_count, region_counters, plugin_reports)
+    if os.environ.get("ONLY_PLUGINS", "").strip() == "wula.py" and not wula_count:
+        raise RuntimeError("乌拉已下载订阅，但没有节点通过最终验证；停止同步私库")
 
 if __name__ == "__main__":
     raw, reports = run_plugins_with_cache()

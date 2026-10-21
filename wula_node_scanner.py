@@ -30,7 +30,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
+import requests
 
+SCHEMA_VERSION = 2  # v2: scanner 与插件统一 requests/HTTP1.1
 HERE = os.path.dirname(os.path.abspath(__file__))
 VAULT = os.path.join(HERE, "vault_repo")
 POOL_FILE = os.path.join(VAULT, "wula_pool.json")
@@ -111,12 +113,15 @@ def mark_burn(egress, why=""):
             log(f"烧名单落盘失败: {e}")
 
 
-def _pool_age_ok(interval):
-    """池子是否仍在有效期内。返回 (ok, 已过秒数, 总条数)。"""
+def _pool_age_ok(interval, deep=False):
+    """校验缓存有效期、传输版本与探测级别。"""
     if not os.path.exists(POOL_FILE):
         return False, 0, 0
     try:
-        data = json.load(open(POOL_FILE, encoding="utf-8"))
+        with open(POOL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False, 0, 0
     except Exception:
         return False, 0, 0
     ts = data.get("ts") or 0
@@ -126,7 +131,8 @@ def _pool_age_ok(interval):
         except Exception:
             ts = 0
     age = time.time() - ts if ts else 10 ** 9
-    return age < interval, age, len(data.get("nodes") or {})
+    compatible = data.get("schema_version") == SCHEMA_VERSION and (not deep or data.get("deep") is True)
+    return compatible and age < interval, age, len(data.get("nodes") or {})
 
 
 def find_mihomo():
@@ -217,50 +223,40 @@ def test_node(mihomo, proxy, port, target=PROBE, deep=False):
                                 start_new_session=True)
         try:
             time.sleep(1.0)  # 等端口起来
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({
-                "http": f"http://127.0.0.1:{port}",
-                "https": f"http://127.0.0.1:{port}",
-            }))
-            # 先探出口 IP（wula 侧烧名单按出口 IP 粒度，池子也要标注）
-            egress = None
-            try:
-                with opener.open("https://api.ipify.org", timeout=PER_NODE_TIMEOUT) as r:
-                    egress = (r.read(64).decode().strip() or None)
-            except Exception:
+            if proc.poll() is not None:
+                return False, "CORE-EXIT", None
+            with requests.Session() as session:
+                session.trust_env = False
+                session.proxies.update({"http": f"http://127.0.0.1:{port}",
+                                        "https": f"http://127.0.0.1:{port}"})
+                session.headers.update({"User-Agent": "Mozilla/5.0", "accept": "application/json"})
                 egress = None
-            if deep:
-                # 深测：直接打 wula 的 challenge 接口，看是否被风控软拒
-                base = target.rstrip("/") if target.startswith("http") else PROBE.rstrip("/")
-                req = urllib.request.Request(
-                    base + CHALLENGE_PATH,
-                    data=b"{}",
-                    headers={"Content-Type": "application/json",
-                             "User-Agent": "Mozilla/5.0",
-                             "accept": "application/json"},
-                    method="POST")
                 try:
-                    with opener.open(req, timeout=PER_NODE_TIMEOUT) as r:
-                        body = r.read(4000)
-                    j = json.loads(body.decode("utf-8", "ignore"))
-                    if j.get("token") and j.get("challenge"):
-                        return True, "CHAL-OK", egress
-                    return False, "CHAL-BAD", egress
-                except urllib.error.HTTPError as e:
-                    return False, f"CHAL-HTTP{e.code}", egress
-                except Exception as e:
-                    return False, f"CHAL-{type(e).__name__}", egress
-            try:
-                r = opener.open(target, timeout=PER_NODE_TIMEOUT)
+                    r = session.get("https://api.ipify.org", timeout=(4, PER_NODE_TIMEOUT))
+                    r.raise_for_status()
+                    egress = r.text.strip() or None
+                except requests.RequestException:
+                    pass  # ipify 不通不等于目标站不通
+                if deep:
+                    base = target.rstrip("/") if target.startswith("http") else PROBE.rstrip("/")
+                    try:
+                        r = session.post(base + CHALLENGE_PATH, json={},
+                                         headers={"origin": base, "referer": base + "/"},
+                                         timeout=(4, PER_NODE_TIMEOUT))
+                        if r.status_code != 200:
+                            return False, f"CHAL-HTTP{r.status_code}", egress
+                        j = r.json()  # 完整 JSON，不再截断4000字节
+                        ok = (isinstance(j, dict) and j.get("token") and j.get("challenge") and j.get("instrumentation"))
+                        return bool(ok), "CHAL-OK" if ok else "CHAL-BAD", egress
+                    except Exception as e:
+                        return False, f"CHAL-{type(e).__name__}", egress
                 try:
-                    r.read(128)
-                except Exception:
-                    pass
-                return True, f"HTTP{r.status}", egress
-            except urllib.error.HTTPError as e:
-                # 拿到 HTTP 响应 = 连接层通（403 WAF 也算节点可达）
-                return True, f"HTTP{e.code}", egress
-            except Exception as e:
-                return False, type(e).__name__, egress
+                    r = session.get(target, timeout=(4, PER_NODE_TIMEOUT), stream=True)
+                    status = r.status_code
+                    r.close()
+                    return True, f"HTTP{status}", egress
+                except requests.RequestException as e:
+                    return False, type(e).__name__, egress
         finally:
             try:
                 proc.terminate()
@@ -290,7 +286,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列当前池子")
     ap.add_argument("--target", default=PROBE, help="探测目标 URL")
     ap.add_argument("--deep", action="store_true",
-                    help="深测：还要求 challenge 接口返回合法 token（能真正注册）")
+                    help="深测：要求 challenge 完整响应；不代表 redeem/register 已验证")
     ap.add_argument("--keep", action="store_true",
                     help="与旧池子合并（默认覆盖）")
     args = ap.parse_args()
@@ -309,9 +305,9 @@ def main():
         return 0
 
     # 定时机制：池子未过期且不为空时直接跳过（--force 可强制重扫）
-    interval = args.interval * 3600 if args.interval > 0 else DEFAULT_INTERVAL
-    if not args.force:
-        fresh, age, cnt = _pool_age_ok(interval)
+    interval = max(0, args.interval * 3600)
+    if not args.force and interval > 0:
+        fresh, age, cnt = _pool_age_ok(interval, args.deep)
         if fresh and cnt > 0:
             log(f"⏭️ 池子仍有效（{cnt} 条，{age/3600:.1f}h 前扫的，"
                 f"间隔 {interval//3600}h），跳过本轮。--force 可强制重扫")
@@ -360,11 +356,7 @@ def main():
         if ok:
             with lock:
                 good[proxy["name"]] = {**proxy, "egress": egress}
-        elif (args.deep and egress and verdict.startswith("CHAL-")
-              and not verdict.startswith("CHAL-BAD")
-              and not verdict.startswith("CHAL-HTTP")):
-            # challenge 在网络层挂掉 = 这个出口在 wula 那里不受欢迎（或节点死）→ 烧名单
-            mark_burn(egress, verdict)
+        # 超时/SSL错误只影响本轮探测，不写24小时封禁名单。
         return ok
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -378,6 +370,8 @@ def main():
 
     # 出口 IP（用第一个可用节点确认）
     out = {
+        "schema_version": SCHEMA_VERSION,
+        "transport": "requests-http1.1",
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "ts": int(time.time()),
         "target": args.target,

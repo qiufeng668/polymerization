@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '*/50 * * * *'
   workflow_dispatch:
+    inputs:
+      wula_only:
+        description: '仅运行乌拉并同步私库，跳过其它插件'
+        type: boolean
+        default: false
+
+concurrency:
+  group: aggregator-private-vault
+  cancel-in-progress: false
 
 jobs:
   build-and-sync:
@@ -27,6 +36,8 @@ jobs:
           python-version: '3.11'
       - run: |
           pip install -r requirements.txt
+      - name: 乌拉离线回归检查
+        run: python -m unittest discover -s tests -v
 
       - name: 4. ⚡ 下载真连接测速内核 (LiteSpeedTest) + 自举代理内核 (mihomo)
         run: |
@@ -43,7 +54,7 @@ jobs:
         run: |
           # 内置 @interval: 6h —— 池子未过期自动跳过；过期才重扫
           # --budget 兜住单次时长，超时保存已完成的结果
-          python3 wula_node_scanner.py --deep --workers 20 --budget 900 || echo "⚠️ 节点扫描无结果"
+          python3 wula_node_scanner.py --deep --workers 8 --budget 120 || echo "⚠️ 节点扫描无结果，将继续验证默认网络和历史订阅"
           python3 wula_node_scanner.py --list
 
       - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
@@ -51,11 +62,17 @@ jobs:
           PYTHONUNBUFFERED: "1"
           # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
           MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
-          WULA_MAX_ATTEMPTS: "16"
+          WULA_MAX_ATTEMPTS: "8"
+          WULA_BUDGET_SECONDS: "480"
+          WULA_ONLY: "${{ inputs.wula_only }}"
         run: |
           echo "🎯 节点池状态:"
           python3 wula_node_scanner.py --list || true
-          python -u main_engine.py
+          if [ "$WULA_ONLY" = "true" ]; then
+            ONLY_PLUGINS=wula.py python -u -c 'import main_engine as m; nodes,reports=m.run_plugins_with_cache(); assert any(r["name"]=="wula.py" and r["fail_count"]==0 and r["count"]>0 for r in reports), "乌拉未产出节点"; m.deduplicate_and_speedtest(nodes,reports)'
+          else
+            python -u main_engine.py
+          fi
 
       - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
         run: |
