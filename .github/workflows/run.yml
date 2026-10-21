@@ -9,13 +9,41 @@ on:
         description: '仅运行乌拉并同步私库，跳过其它插件'
         type: boolean
         default: false
+      diagnose_only:
+        description: '只读诊断 DNS、注册站、订阅下载和转发，不创建账号或同步私库'
+        type: boolean
+        default: false
 
 concurrency:
   group: aggregator-private-vault
   cancel-in-progress: false
 
 jobs:
+  network-diagnosis:
+    if: ${{ inputs.diagnose_only }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/polymerization-1
+          token: ${{ secrets.GIT_TOKEN }}
+          path: vault_repo
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install requests pyyaml
+      - name: Diagnose network without creating accounts or writing vault
+        run: python -u wula_diagnose.py
+
   build-and-sync:
+    if: ${{ !inputs.diagnose_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -50,7 +78,12 @@ jobs:
             && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
             && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
 
+      - name: Wula read-only network diagnosis
+        if: ${{ inputs.diagnose_only }}
+        run: python -u wula_diagnose.py
+
       - name: 4.5 🎯 扫描可用节点（定时 6h，留 wula 用，不影响其它插件）
+        if: ${{ !inputs.diagnose_only }}
         run: |
           # 内置 @interval: 6h —— 池子未过期自动跳过；过期才重扫
           # --budget 兜住单次时长，超时保存已完成的结果
