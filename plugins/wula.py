@@ -37,7 +37,9 @@ def _new_session():
         s.proxies = {"http": PROXY, "https": PROXY}
     return s
 
-SUFFIXES = ["gmail.com", "qq.com", "163.com", "126.com", "outlook.com", "hotmail.com", "yahoo.com", "foxmail.com", "sina.com", "yeah.net"]
+SUFFIXES = ["gmail.com", "qq.com", "163.com", "126.com", "outlook.com", "hotmail.com", "yahoo.com", "foxmail.com", "sina.com", "yeah.net",
+            "sohu.com", "aliyun.com", "139.com", "189.cn", "wo.cn", "vip.qq.com", "vip.163.com", "vip.126.com",
+            "21cn.com", "139.com", "5.cn", "tom.com", "yeah.com"]
 
 BASE = "https://wula001.com"
 # 提示: 标准库 requests 即可直连, 无需额外依赖
@@ -306,6 +308,138 @@ def _register_one(email, password):
                 time.sleep(3 * attempt)
     raise RuntimeError(f"重试{RETRY}次均失败: {last}")
 
+# ---------------- 节点池轮换 (失败换节点重试) ----------------
+_NODE_PORT = 7899
+_NODE_PROC = None
+
+
+def _load_node_pool():
+    """从 vault_repo/wula_pool.json 读扫描好的可用节点（扫描器产出）。"""
+    import json as _json
+    cands = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vault_repo", "wula_pool.json"),
+        os.path.join(os.getcwd(), "vault_repo", "wula_pool.json"),
+        "/tmp/wula_pool.json",
+    ]
+    for c in cands:
+        c = os.path.abspath(c)
+        if not os.path.exists(c):
+            continue
+        try:
+            with open(c, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            nodes = list((data.get("nodes") or {}).values())
+            if nodes:
+                print(f"[*] 节点池: {len(nodes)} 条 ({c})", flush=True)
+                return nodes
+        except Exception as e:
+            print(f"[!] 读池子失败 {c}: {e}", flush=True)
+    return []
+
+
+def _find_mihomo():
+    import shutil as _sh
+    for cand in ("/usr/local/bin/mihomo", "./mihomo", "mihomo"):
+        p = _sh.which(cand) if os.sep not in cand else cand
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def _start_node_proxy(node, attempt):
+    """给单个节点起 mihomo，监听 _NODE_PORT。失败返回 False。"""
+    global _NODE_PROC
+    import subprocess as _sp
+    try:
+        import yaml as _yaml
+    except Exception:
+        print("[!] 缺 pyyaml，无法切换节点", flush=True)
+        return False
+
+    binary = _find_mihomo()
+    if not binary:
+        print("[!] 找不到 mihomo，无法切换节点", flush=True)
+        return False
+
+    # 停掉上一个
+    if _NODE_PROC is not None:
+        try:
+            _NODE_PROC.terminate()
+            _NODE_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                _NODE_PROC.kill()
+            except Exception:
+                pass
+        _NODE_PROC = None
+
+    class _D(_yaml.Dumper):
+        pass
+
+    class _Q(str):
+        pass
+
+    def _qr(d, x):
+        return d.represent_scalar('tag:yaml.org,2002:str', x, style="'")
+
+    _D.add_representer(_Q, _qr)
+
+    def _q(o):
+        if isinstance(o, dict):
+            return {k: _q(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_q(v) for v in o]
+        if isinstance(o, str) and o:
+            return _Q(o)
+        return o
+
+    cfg = {
+        "mixed-port": _NODE_PORT,
+        "allow-lan": False,
+        "bind-address": "127.0.0.1",
+        "mode": "rule",
+        "log-level": "silent",
+        "proxies": [node],
+        "proxy-groups": [{"name": "G", "type": "select", "proxies": [node["name"]]}],
+        "rules": ["MATCH,G"],
+    }
+    path = f"/tmp/wula_node_{_NODE_PORT}.yaml"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            _yaml.dump(_q(cfg), f, Dumper=_D, allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        print(f"[!] 写节点配置失败: {e}", flush=True)
+        return False
+
+    try:
+        _NODE_PROC = _sp.Popen([binary, "-f", path],
+                               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                               start_new_session=True)
+    except Exception as e:
+        print(f"[!] 启动 mihomo 失败: {e}", flush=True)
+        return False
+
+    time.sleep(1.2)
+    if _NODE_PROC.poll() is not None:
+        print(f"[!] 节点进程启动即退出，回退直连: {node['name'][:40]}", flush=True)
+        return False
+    return True
+
+
+def _stop_node_proxy():
+    global _NODE_PROC
+    if _NODE_PROC is not None:
+        try:
+            _NODE_PROC.terminate()
+            _NODE_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                _NODE_PROC.kill()
+            except Exception:
+                pass
+        _NODE_PROC = None
+
+
 def _rand_password(n=12):
     pools = [string.ascii_lowercase, string.ascii_uppercase, string.digits, "!@#$%"]
     pw = [random.choice(p) for p in pools]
@@ -318,6 +452,55 @@ def _rand_email():
     num = random.randint(1000, 99999999)
     letters = "".join(random.choice(string.ascii_lowercase) for _ in range(random.randint(3, 7)))
     return f"{letters}{num}@{suf}"
+
+# ---- 已用邮箱记录：避免反复用同一批邮箱撞车 ----
+_USED_EMAILS_FILE = None
+
+def _used_emails_path():
+    global _USED_EMAILS_FILE
+    if _USED_EMAILS_FILE:
+        return _USED_EMAILS_FILE
+    cands = ["/tmp/wula_used_emails.txt", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wula_used_emails.txt")]
+    for c in cands:
+        try:
+            d = os.path.dirname(c)
+            if d and not os.path.isdir(d):
+                continue
+            _USED_EMAILS_FILE = c
+            return c
+        except Exception:
+            continue
+    _USED_EMAILS_FILE = "/tmp/wula_used_emails.txt"
+    return _USED_EMAILS_FILE
+
+def _load_used():
+    p = _used_emails_path()
+    if not os.path.exists(p):
+        return set()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return set(l.strip().lower() for l in f if l.strip())
+    except Exception:
+        return set()
+
+def _mark_used(email):
+    try:
+        p = _used_emails_path()
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(email.lower() + "\n")
+    except Exception:
+        pass
+
+def _rand_email_unique():
+    """生成没在本机用过的邮箱，最多试 200 次。"""
+    used = _load_used()
+    for _ in range(200):
+        e = _rand_email()
+        if e.lower() not in used:
+            return e
+    # 兜底：加时间戳保证唯一
+    ts = str(int(time.time() * 1000))[-8:]
+    return f"{_rand_email().split('@')[0]}{ts}@{random.choice(SUFFIXES)}"
 
 def _fetch_nodes(token):
     """用 clash UA 拉订阅, 返回 (yaml_text, 节点URI列表, 原始b64)"""
@@ -432,19 +615,54 @@ def main():
     t0 = time.time()
     stopped = False
 
-    email = _rand_email()
-    pwd = args.password or _rand_password()
-    try:
-        acc = _register_one(email, pwd)
-        accounts.append(acc)
-        print(f"  [1/1] OK  {email}  密码:{pwd}")
-        print(f"        {acc['subscribe_url']}")
-    except _Banned as ex:
-        print(f"\n[!!] {ex}")
-        print("[!!] 疑似 IP 被风控拉黑。请换 IP (手机开飞行模式10秒 / 换梯子节点) 后再试。")
+    # ---------- 轮换节点重试：失败就换，直到成功 ----------
+    pool = _load_node_pool()
+    tried = set()
+    max_attempts = int(os.environ.get("WULA_MAX_ATTEMPTS", "0")) or (len(pool) + 1 if pool else 1)
+
+    acc = None
+    for attempt_no in range(1, max_attempts + 1):
+        # 选一个还没试过的节点
+        node = None
+        if pool:
+            cand = [n for n in pool if n["name"] not in tried]
+            if not cand:
+                print("[!] 节点池已试完，重新洗牌再来一轮", flush=True)
+                tried.clear()
+                cand = pool
+            node = random.choice(cand)
+            tried.add(node["name"])
+            if _start_node_proxy(node, attempt_no):
+                args.proxy = f"http://127.0.0.1:{_NODE_PORT}"
+                PROXY = args.proxy
+                print(f"\n[{attempt_no}/{max_attempts}] 换节点: {node['name'][:50]}", flush=True)
+            else:
+                args.proxy = None
+                PROXY = None
+                print(f"\n[{attempt_no}/{max_attempts}] 节点不可用，回退直连: {node['name'][:40]}", flush=True)
+        elif attempt_no > 1:
+            print(f"\n[{attempt_no}/{max_attempts}] 直接重试", flush=True)
+
+        email = _rand_email_unique()
+        pwd = args.password or _rand_password()
+        try:
+            acc = _register_one(email, pwd)
+            _mark_used(email)
+            accounts.append(acc)
+            print(f"  [1/1] OK  {email}  密码:{pwd}", flush=True)
+            print(f"        {acc['subscribe_url']}", flush=True)
+            break
+        except _Banned as ex:
+            print(f"  ✗ {email} → 网络层失败: {str(ex)[:100]}", flush=True)
+            continue
+        except Exception as ex:
+            print(f"  ✗ {email} → {str(ex)[:100]}", flush=True)
+            time.sleep(random.uniform(2, 5))
+            continue
+
+    if not accounts:
+        print("\n[!!] 所有尝试均失败。", flush=True)
         stopped = True
-    except Exception as ex:
-        print(f"  [1/1] FAIL {email}  {ex}")
 
     # 确定结果保存目录 (CI/GitHub 用 --outdir output)
     if args.outdir:
