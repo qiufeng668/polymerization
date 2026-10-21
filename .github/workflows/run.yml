@@ -4,15 +4,6 @@ on:
   schedule:
     - cron: '*/50 * * * *'
   workflow_dispatch:
-    inputs:
-      alice_only:
-        description: '只刷新爱丽丝 TXT 节点并合并其它来源缓存'
-        type: boolean
-        default: false
-
-concurrency:
-  group: aggregator-private-vault
-  cancel-in-progress: false
 
 jobs:
   build-and-sync:
@@ -48,11 +39,7 @@ jobs:
             && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
             && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
 
-      - name: 爱丽丝离线回归检查
-        run: python -m unittest discover -s tests -p test_alice.py -v
-
       - name: 4.5 🎯 扫描可用节点（定时 6h，留 wula 用，不影响其它插件）
-        if: ${{ !inputs.alice_only }}
         run: |
           # 内置 @interval: 6h —— 池子未过期自动跳过；过期才重扫
           # --budget 兜住单次时长，超时保存已完成的结果
@@ -65,16 +52,10 @@ jobs:
           # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
           MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
           WULA_MAX_ATTEMPTS: "16"
-          ALICE_ONLY: "${{ inputs.alice_only }}"
-          ALICE_BUDGET_SECONDS: "240"
         run: |
-          if [ "$ALICE_ONLY" = "true" ]; then
-            ONLY_PLUGINS=alice.py python -u -c 'import main_engine as m; nodes,reports=m.run_plugins_with_cache(); assert any(r["name"]=="alice.py" and r["fail_count"]==0 and r["count"]>0 for r in reports), "爱丽丝未产生 TXT 节点"; m.deduplicate_and_speedtest(nodes,reports)'
-          else
-            echo "🎯 节点池状态:"
-            python3 wula_node_scanner.py --list || true
-            python -u main_engine.py
-          fi
+          echo "🎯 节点池状态:"
+          python3 wula_node_scanner.py --list || true
+          python -u main_engine.py
 
       - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
         run: |

@@ -879,13 +879,6 @@ def run_plugins_with_cache():
             cached_nodes = [apply_source_prefix(u, _tag) for u in cached_nodes]
         fail_count = info.get("fail_count", 0)
         elapsed = now - last_run
-        selected = {n.strip() for n in os.environ.get("ONLY_PLUGINS", "").split(",") if n.strip()}
-        if selected and script_name not in selected:
-            all_raw_nodes.extend(cached_nodes)
-            plugin_reports.append({"name": script_name, "interval": format_interval(interval_sec),
-                                   "status": "⏭️ 定向验证：沿用缓存", "count": len(cached_nodes),
-                                   "fail_count": fail_count, "advice": "未执行，保留缓存"})
-            continue
 
         if manual_force or elapsed + 180 >= interval_sec or not cached_nodes:
             print(f"🚀 [执行] {script_name} (设定间隔: {format_interval(interval_sec)}, 历史连续失败: {fail_count}次)")
