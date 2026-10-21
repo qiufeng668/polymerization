@@ -255,6 +255,125 @@ class _Banned(Exception):
     """判定 IP 已被风控拉黑, 立即停止整批"""
     pass
 
+# ---------------- 出口IP烧名单（跨运行持久化, 防止反复鞭尸同一批死IP） ----------------
+# 判定: 打 wula 时网络层失败/软拒 的出口 IP 记 1 次; 24h 内不再使用该出口
+BURN_DECAY_H = int(os.environ.get("WULA_BURN_DECAY_H", "24"))
+
+def _vault_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.abspath(os.path.join(here, "..", "vault_repo"))
+    return p
+
+def _burn_path():
+    return os.path.join(_vault_dir(), "wula_burn.json")
+
+def _load_burn():
+    p = _burn_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    expire = time.time() - BURN_DECAY_H * 3600
+    return {ip: v for ip, v in (data or {}).items()
+            if isinstance(v, dict) and float(v.get("ts", 0) or 0) >= expire}
+
+def _save_burn(b):
+    p = _burn_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(b, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print(f"[!] 烧名单落盘失败: {e}", flush=True)
+
+def _mark_burn(egress, why=""):
+    """出口 IP 本次打挂 → 记录。Actions 跨运行共享（vault_repo 会同步私有库）。"""
+    if not egress:
+        return
+    b = _load_burn()
+    v = b.get(egress) or {"ts": 0, "fails": 0}
+    v["fails"] = int(v.get("fails", 0)) + 1
+    v["ts"] = time.time()
+    if why:
+        v["last_err"] = str(why)[:120]
+    expire = time.time() - BURN_DECAY_H * 3600
+    b = {k: x for k, x in b.items() if float((x or {}).get("ts", 0) or 0) >= expire}
+    b[egress] = v
+    _save_burn(b)
+    print(f"  🔥 出口 {egress} 记入烧名单 (累计{v['fails']}次, {BURN_DECAY_H}h内不再用)"
+          + (f" | {str(why)[:70]}" if why else ""), flush=True)
+
+def _is_burned(egress):
+    if not egress:
+        return False
+    v = _load_burn().get(egress)
+    return bool(v and int(v.get("fails", 0)) >= 1)
+
+# ---------------- 储备账号：新注册全失败时兜底 ----------------
+BANK_FALLBACK_ON = os.environ.get("WULA_BANK_FALLBACK", "1") != "0"
+
+def _bank_path():
+    return os.path.join(_vault_dir(), "wula_bank.json")
+
+def _save_bank(acc):
+    if not acc or not acc.get("token"):
+        return
+    p = _bank_path()
+    bank = []
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                bank = json.load(f)
+        except Exception:
+            bank = []
+    bank = [x for x in bank if isinstance(x, dict) and x.get("token") != acc.get("token")]
+    bank.insert(0, {"email": acc.get("email"), "password": acc.get("password"),
+                    "token": acc.get("token"), "subscribe_url": acc.get("subscribe_url"),
+                    "ts": int(time.time())})
+    bank = bank[:10]
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(bank, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print(f"[!] 储备账号落盘失败: {e}", flush=True)
+
+def _use_bank():
+    """从储备账号里挑活的拉一次订阅验证。返回 (entry, uris, ytext) 或 None。"""
+    p = _bank_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            bank = json.load(f)
+    except Exception:
+        return None
+    for entry in bank[:5]:
+        token = entry.get("token")
+        if not token:
+            continue
+        try:
+            ytext, uris, err = _fetch_nodes(token)
+            if not err and uris:
+                # 回写时间戳，把这条挪到最新
+                try:
+                    bank.remove(entry)
+                    entry["ts"] = int(time.time())
+                    bank.insert(0, entry)
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(bank, f, ensure_ascii=False, indent=1)
+                except Exception:
+                    pass
+                return entry, uris, ytext
+        except Exception:
+            continue
+    return None
+
+
 def _is_network_block(ex):
     msg = str(ex).lower()
     for kw in ("timed out", "timeout", "connection", "eof", "reset", "refused",
@@ -410,14 +529,17 @@ def _start_node_proxy(node, attempt):
             return _Q(o)
         return o
 
+    # pool 节点带 egress 等扫描元数据, mihomo 不认识 → 剥掉
+    p_node = {k: v for k, v in node.items() if k not in ("egress", "exit_ip")}
+
     cfg = {
         "mixed-port": _NODE_PORT,
         "allow-lan": False,
         "bind-address": "127.0.0.1",
         "mode": "rule",
         "log-level": "silent",
-        "proxies": [node],
-        "proxy-groups": [{"name": "G", "type": "select", "proxies": [node["name"]]}],
+        "proxies": [p_node],
+        "proxy-groups": [{"name": "G", "type": "select", "proxies": [p_node["name"]]}],
         "rules": ["MATCH,G"],
     }
     path = f"/tmp/wula_node_{_NODE_PORT}.yaml"
@@ -624,7 +746,6 @@ def _save_results(accounts, save_dir, nodes_all):
         json.dump([{"uri": u} for u in uniq], f, ensure_ascii=False, indent=2)
     return txt_path, json_path, node_path, len(uniq)
 
-
 def main():
     # 简化: 每次只注册 1 个账号 (批量注册功能已移除)
     ap = argparse.ArgumentParser(add_help=False)
@@ -663,53 +784,103 @@ def main():
         # 池子为空 → 自己扫一遍（只影响本次运行，不影响别的插件）
         pool = _auto_scan_pool()
     tried = set()
+    used_egress = set()
     max_attempts = int(os.environ.get("WULA_MAX_ATTEMPTS", "0")) or (len(pool) + 1 if pool else 1)
 
+    def _pick_node():
+        """按 pool 顺序找下一个可用节点：跳过已试名字 / 烧名单出口 / 本轮已用出口。"""
+        for n in pool:
+            nm = n.get("name")
+            if nm in tried:
+                continue
+            eg = n.get("egress")
+            if eg and _is_burned(eg):
+                n_fails = int((_load_burn().get(eg) or {}).get("fails", 0))
+                print(f"  ⏭️ 出口 {eg} 在烧名单({n_fails}次) → 跳过 {str(nm)[:42]}", flush=True)
+                tried.add(nm)
+                continue
+            if eg and eg in used_egress:
+                tried.add(nm)
+                continue
+            return n
+        return None
+
     acc = None
-    for attempt_no in range(1, max_attempts + 1):
-        # 选一个还没试过的节点
-        node = None
+    real = 0
+    guard = 0
+    while real < max_attempts and guard < 4 * max_attempts + 10:
+        guard += 1
+        args.proxy = None
+        PROXY = None
+        egress = None
         if pool:
-            cand = [n for n in pool if n["name"] not in tried]
-            if not cand:
-                print("[!] 节点池已试完，重新洗牌再来一轮", flush=True)
-                tried.clear()
-                cand = pool
-            node = random.choice(cand)
-            tried.add(node["name"])
-            if _start_node_proxy(node, attempt_no):
-                args.proxy = f"http://127.0.0.1:{_NODE_PORT}"
-                PROXY = args.proxy
-                egress = _probe_egress(_NODE_PORT)
-                if egress is None:
-                    print(f"\n[{attempt_no}/{max_attempts}] 节点不通，跳过: {node['name'][:45]}", flush=True)
-                    _stop_node_proxy()
+            node = _pick_node()
+            if node is not None:
+                tried.add(node.get("name"))
+                if _start_node_proxy(node, real + 1):
+                    args.proxy = f"http://127.0.0.1:{_NODE_PORT}"
+                    PROXY = args.proxy
+                    egress = _probe_egress(_NODE_PORT)
+                    if egress is None:
+                        print(f"  · 节点不通(出口探测失败)，跳过: {node['name'][:45]}", flush=True)
+                        _stop_node_proxy()
+                        continue
+                    if _is_burned(egress) or egress in used_egress:
+                        print(f"  · 出口 {egress} 已烧/本轮已用 → 跳过 {node['name'][:45]}", flush=True)
+                        _stop_node_proxy()
+                        continue
+                    used_egress.add(egress)
+                    real += 1
+                    print(f"\n[{real}/{max_attempts}] 尝试: {node['name'][:45]}  (出口 {egress})", flush=True)
+                else:
+                    print(f"  · 节点配置无效: {node.get('name','')[:40]}", flush=True)
                     continue
-                print(f"\n[{attempt_no}/{max_attempts}] 换节点: {node['name'][:45]} (出口 {egress})", flush=True)
+            elif real == 0:
+                real += 1
+                print(f"\n[{real}/{max_attempts}] 无干净候选 → 直连尝试", flush=True)
             else:
-                args.proxy = None
-                PROXY = None
-                print(f"\n[{attempt_no}/{max_attempts}] 节点不可用，回退直连: {node['name'][:40]}", flush=True)
-        elif attempt_no > 1:
-            print(f"\n[{attempt_no}/{max_attempts}] 直接重试", flush=True)
+                print("[*] 池子里没有干净出口了，收工", flush=True)
+                break
+        else:
+            real += 1
+            print(f"\n[{real}/{max_attempts}] 无节点池, 直连尝试", flush=True)
 
         email = _rand_email_unique()
         pwd = args.password or _rand_password()
         try:
             acc = _register_one(email, pwd)
             _mark_used(email)
+            _save_bank(acc)
             accounts.append(acc)
             print(f"  [1/1] OK  {email}  密码:{pwd}", flush=True)
             print(f"        {acc['subscribe_url']}", flush=True)
             break
         except _Banned as ex:
             print(f"  ✗ {email} → 网络层失败: {str(ex)[:100]}", flush=True)
+            if egress:
+                _mark_burn(egress, str(ex))
             continue
         except Exception as ex:
-            print(f"  ✗ {email} → {str(ex)[:100]}", flush=True)
+            msg = str(ex)
+            print(f"  ✗ {email} → {msg[:100]}", flush=True)
+            # 软拒(邮箱已在系统中存在等) = 该出口被拉黑的另一种表现
+            if egress and ("存在" in msg or "already" in msg.lower()):
+                _mark_burn(egress, "soft-reject: " + msg)
             time.sleep(random.uniform(2, 5))
             continue
 
+    bank_used = False
+    if not accounts and BANK_FALLBACK_ON:
+        print("\n[*] 新注册全失败 → 尝试储备账号兜底（历史成功注册的 wula 订阅，非新注册）", flush=True)
+        hit = _use_bank()
+        if hit:
+            entry, pre_uris, pre_ytext = hit
+            age_h = round((time.time() - float(entry.get("ts") or 0)) / 3600, 1)
+            print(f"  ⚠️ 兜底: {entry.get('email')} ({age_h}h 前注册) → {len(pre_uris)} 节点", flush=True)
+            accounts.append({**{k: v for k, v in entry.items() if k != "ts"},
+                             "node_count": len(pre_uris), "bank_fallback": True,
+                             "_pre_uris": pre_uris, "_pre_ytext": pre_ytext})
+            bank_used = True
     if not accounts:
         print("\n[!!] 所有尝试均失败。", flush=True)
         stopped = True
@@ -742,7 +913,12 @@ def main():
             token = a.get("token") or ""
             if not token:
                 continue
-            ytext, uris, err = _fetch_nodes(token)
+            if a.get("_pre_uris") is not None:
+                ytext = a.get("_pre_ytext") or ""
+                uris = a["_pre_uris"]
+                err = None
+            else:
+                ytext, uris, err = _fetch_nodes(token)
             if err:
                 print(f"  [{idx}] 订阅拉取失败: {err}")
                 continue
@@ -759,6 +935,8 @@ def main():
     # 明文打印全部结果
     print("\n" + "=" * 50)
     print(f"[+] 成功 {len(accounts)} 个账号, 去重后 {uniq_n} 个节点, 用时 {round(time.time()-t0,1)}s")
+    if bank_used:
+        print("[!] 本次为储备账号兜底输出（历史注册账号的订阅），非新注册")
     print("=" * 50)
     for idx, a in enumerate(accounts, 1):
         print(f"\n[{idx}] 邮箱: {a['email']}")
