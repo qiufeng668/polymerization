@@ -337,6 +337,30 @@ def _load_node_pool():
     return []
 
 
+def _auto_scan_pool(budget=None):
+    """池子为空时，自己跑一遍扫描器（深测 challenge），把能注册的节点找出来。
+    只在被调用时执行，不影响其他插件。"""
+    import subprocess as _sp
+    scanner = None
+    for cand in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "wula_node_scanner.py"),
+                 "wula_node_scanner.py",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wula_node_scanner.py")):
+        if os.path.exists(cand):
+            scanner = os.path.abspath(cand)
+            break
+    if not scanner:
+        print("[!] 找不到 wula_node_scanner.py，无法自动扫描", flush=True)
+        return []
+    budget = budget or int(os.environ.get("WULA_SCAN_BUDGET", "600"))
+    print(f"[*] 节点池为空，自动扫描（预算 {budget}s）...", flush=True)
+    try:
+        _sp.run([sys.executable, scanner, "--deep", "--budget", str(budget)],
+                timeout=budget + 120, check=False)
+    except Exception as e:
+        print(f"[!] 自动扫描失败: {e}", flush=True)
+    return _load_node_pool()
+
+
 def _find_mihomo():
     import shutil as _sh
     for cand in ("/usr/local/bin/mihomo", "./mihomo", "mihomo"):
@@ -363,14 +387,7 @@ def _start_node_proxy(node, attempt):
 
     # 停掉上一个
     if _NODE_PROC is not None:
-        try:
-            _NODE_PROC.terminate()
-            _NODE_PROC.wait(timeout=3)
-        except Exception:
-            try:
-                _NODE_PROC.kill()
-            except Exception:
-                pass
+        _kill_proc(_NODE_PROC)
         _NODE_PROC = None
 
     class _D(_yaml.Dumper):
@@ -426,17 +443,42 @@ def _start_node_proxy(node, attempt):
     return True
 
 
+def _probe_egress(port, timeout=12):
+    """用这条代理请求一次出口 IP，验证节点真的通。返回 IP 字符串或 None。"""
+    import urllib.request as _ur
+    op = _ur.build_opener(_ur.ProxyHandler({
+        "http": f"http://127.0.0.1:{port}",
+        "https": f"http://127.0.0.1:{port}",
+    }))
+    try:
+        with op.open("https://api.ipify.org", timeout=timeout) as r:
+            return r.read().decode().strip() or None
+    except Exception:
+        return None
+
+
+def _kill_proc(proc):
+    """彻底杀掉 mihomo 及其子进程（它是新会话的组长，要按进程组杀）。"""
+    if proc is None:
+        return
+    import signal as _sig
+    try:
+        os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
 def _stop_node_proxy():
     global _NODE_PROC
     if _NODE_PROC is not None:
-        try:
-            _NODE_PROC.terminate()
-            _NODE_PROC.wait(timeout=3)
-        except Exception:
-            try:
-                _NODE_PROC.kill()
-            except Exception:
-                pass
+        _kill_proc(_NODE_PROC)
         _NODE_PROC = None
 
 
@@ -617,6 +659,9 @@ def main():
 
     # ---------- 轮换节点重试：失败就换，直到成功 ----------
     pool = _load_node_pool()
+    if not pool:
+        # 池子为空 → 自己扫一遍（只影响本次运行，不影响别的插件）
+        pool = _auto_scan_pool()
     tried = set()
     max_attempts = int(os.environ.get("WULA_MAX_ATTEMPTS", "0")) or (len(pool) + 1 if pool else 1)
 
@@ -635,7 +680,12 @@ def main():
             if _start_node_proxy(node, attempt_no):
                 args.proxy = f"http://127.0.0.1:{_NODE_PORT}"
                 PROXY = args.proxy
-                print(f"\n[{attempt_no}/{max_attempts}] 换节点: {node['name'][:50]}", flush=True)
+                egress = _probe_egress(_NODE_PORT)
+                if egress is None:
+                    print(f"\n[{attempt_no}/{max_attempts}] 节点不通，跳过: {node['name'][:45]}", flush=True)
+                    _stop_node_proxy()
+                    continue
+                print(f"\n[{attempt_no}/{max_attempts}] 换节点: {node['name'][:45]} (出口 {egress})", flush=True)
             else:
                 args.proxy = None
                 PROXY = None
@@ -719,4 +769,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # 关键：退出前必须关掉自己起的 mihomo，
+        # 否则残留监听会污染后面插件的网络路径
+        try:
+            _stop_node_proxy()
+        except Exception:
+            pass
