@@ -28,11 +28,23 @@ jobs:
       - run: |
           pip install -r requirements.txt
 
-      - name: 4. ⚡ 下载真连接测速内核 (LiteSpeedTest)
+      - name: 4. ⚡ 下载真连接测速内核 (LiteSpeedTest) + 自举代理内核 (mihomo)
         run: |
           wget -q -O lite.gz https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz
           gunzip -f lite.gz
           chmod +x lite
+          # mihomo 用于给被机房 IP 拉黑的插件（如 wula）做自举出口
+          MI_VER="v1.19.32"
+          wget -q -O mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MI_VER}/mihomo-linux-amd64-compatible-${MI_VER}.gz" \
+            && gunzip -f mihomo.gz && chmod +x mihomo && sudo mv mihomo /usr/local/bin/mihomo \
+            && mihomo -v | head -1 || echo "⚠️ mihomo 下载失败，插件将直连"
+
+      - name: 4.5 🔌 自举代理 (把机房 IP 换成真实节点出口)
+        run: |
+          # vault_repo/clash.yaml 是上次跑出来的节点池（第2步已 checkout）
+          # 启动失败不阻断流程，插件会自动回退直连
+          python3 boot_proxy.py || echo "⚠️ 自举代理未就绪，插件将直连"
+          cat /tmp/boot_proxy_url 2>/dev/null || true
 
       - name: 5. 🧠 运行主控引擎 (分频运行 PY + 实时无缓冲日志 + 失效监控 + 真测速)
         env:
@@ -40,6 +52,13 @@ jobs:
           # 手动点击 Run workflow 时强制全跑（绕过 @interval 冷却）；定时自动跑时遵守冷却
           MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
         run: |
+          # 自举代理就绪则把插件出口指过去（wula 等被机房 IP 拉黑的插件靠这个）
+          if [ -f /tmp/boot_proxy_url ]; then
+            export WULA_PROXY="$(cat /tmp/boot_proxy_url)"
+            echo "🔌 插件出口: $WULA_PROXY"
+          else
+            echo "⚠️ 无自举代理，插件直连（机房 IP）"
+          fi
           python -u main_engine.py
 
       - name: 6. 🚀 覆盖推送到私有库 (原生认证 + 无历史垃圾防膨胀)
