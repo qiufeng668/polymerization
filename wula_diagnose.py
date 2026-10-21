@@ -69,9 +69,13 @@ def main():
             s.headers.update({'User-Agent':w._UAS[0],'referer':w.BASE+'/','origin':w.BASE})
             try:
                 r=s.post(w.BASE+'/fd0fb2130e/challenge',json={},timeout=(5,10))
-                j=r.json()
+                try:
+                    j=r.json()
+                except ValueError:
+                    j=None
                 edge_ok=bool(r.ok and isinstance(j,dict) and j.get('token') and j.get('challenge') and j.get('instrumentation'))
-                print('EDGE',edge,'challenge',r.status_code,'complete',edge_ok,flush=True)
+                snippet=' '.join(r.text[:180].split())
+                print('EDGE',edge,'challenge',r.status_code,'ctype',r.headers.get('content-type'),'server',r.headers.get('server'),'complete',edge_ok,'body',snippet,flush=True)
             except Exception as ex:
                 print('EDGE',edge,'challenge',type(ex).__name__,flush=True)
             edge_nodes=0
