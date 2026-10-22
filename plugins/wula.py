@@ -20,6 +20,25 @@ _DEADLINE = None
 class _BudgetExceeded(RuntimeError):
     pass
 
+class _EndpointError(RuntimeError):
+    """请求在传输、HTTP、内容格式或应用校验中的哪一层失败。"""
+    def __init__(self, stage, kind, endpoint, status=None, detail=""):
+        self.stage, self.kind, self.endpoint, self.status = stage, kind, endpoint, status
+        parsed = urllib.parse.urlsplit(endpoint)
+        safe_url = urllib.parse.urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, "", ""))
+        super().__init__(f"{stage}[{kind}] {safe_url}"
+                         + (f" HTTP {status}" if status is not None else "")
+                         + (f": {_error_text(detail)}" if detail else ""))
+
+class _CaptchaUnavailable(RuntimeError):
+    """未拿到 challenge，不能误报为 PoW/instrumentation 拒绝。"""
+    def __init__(self, failures):
+        self.failures = failures
+        self.retry_route = any(e.kind == "transport" or e.status in (429, 502, 503, 504)
+                               for e in failures if isinstance(e, _EndpointError))
+        super().__init__("验证码入口不可用；未进入 PoW/instrumentation 校验。"
+                         + " | ".join(_error_text(e) for e in failures))
+
 def _remaining():
     return max(0.0, _DEADLINE - time.monotonic()) if _DEADLINE else 480.0
 
@@ -37,18 +56,28 @@ def _error_text(ex):
     text = re.sub(r'(?i)(https?://)[^/@\s]+:[^/@\s]+@', r'\1[hidden]@', text)
     return text[:240]
 
-def _json_request(s, path, stage, **kwargs):
+def _json_request(s, path, stage, *, base=None, timeout=None, **kwargs):
+    target = path if path.startswith("https://") else (base or PANEL_BASE).rstrip("/") + "/" + path.lstrip("/")
     try:
-        r = s.post(BASE + path, timeout=_timeout(), **kwargs)
-        r.raise_for_status()
-        value = r.json()
-        if not isinstance(value, dict):
-            raise ValueError("响应不是 JSON object")
-        return value
+        response = s.post(target, timeout=timeout or _timeout(), allow_redirects=False, **kwargs)
     except _BudgetExceeded:
         raise
     except Exception as ex:
-        raise RuntimeError(f"{stage}: {type(ex).__name__}: {_error_text(ex)}") from None
+        raise _EndpointError(stage, "transport", target, detail=type(ex).__name__) from None
+    try:
+        code = response.status_code
+        if not 200 <= code < 300:
+            # 服务端错误正文可能带个人信息；这里只记录确定的层级和状态码。
+            raise _EndpointError(stage, "http", target, status=code)
+        try:
+            value = response.json()
+        except ValueError:
+            raise _EndpointError(stage, "content", target, status=code, detail="响应不是 JSON") from None
+        if not isinstance(value, dict):
+            raise _EndpointError(stage, "content", target, status=code, detail="响应不是 JSON object")
+        return value
+    finally:
+        response.close()
 
 def _new_session():
     s = _rq.Session()
@@ -62,8 +91,19 @@ SUFFIXES = ["gmail.com", "qq.com", "163.com", "126.com", "outlook.com", "hotmail
             "sohu.com", "aliyun.com", "139.com", "189.cn", "wo.cn", "vip.qq.com", "vip.163.com", "vip.126.com",
             "21cn.com", "139.com", "5.cn", "tom.com", "yeah.com"]
 
-BASE = "https://wula001.com"
-# 提示: 标准库 requests 即可直连, 无需额外依赖
+def _https_endpoint(value, name):
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment):
+        raise ValueError(f"{name} 必须为无认证信息、query 和 fragment 的 HTTPS 地址")
+    return value.rstrip("/")
+
+# 三个服务单独配置，不能拿面板可达等同于验证码可达。
+PANEL_BASE = _https_endpoint(os.environ.get("WULA_PANEL_BASE", "https://main.wulavpn.com"), "WULA_PANEL_BASE")
+CAPTCHA_BASE = _https_endpoint(os.environ.get("WULA_CAPTCHA_BASE", "https://wulass.org/fd0fb2130e"), "WULA_CAPTCHA_BASE")
+LEGACY_CAPTCHA_BASE = "https://wula001.com/fd0fb2130e"
+SUBSCRIBE_BASE = _https_endpoint(os.environ.get("WULA_SUBSCRIBE_BASE", PANEL_BASE + "/s"), "WULA_SUBSCRIBE_BASE")
+BASE = PANEL_BASE  # 旧工具的面板地址别名，注册时不再用于拼接验证码。
 _UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -409,6 +449,28 @@ def _is_network_block(ex):
             return True
     return False
 
+def _get_challenge(s):
+    routes = [CAPTCHA_BASE]
+    if not os.environ.get("WULA_CAPTCHA_BASE") and LEGACY_CAPTCHA_BASE not in routes:
+        routes.append(LEGACY_CAPTCHA_BASE)
+    failures = []
+    for endpoint in routes:
+        _check_budget()
+        try:
+            print(f"    · challenge: {urllib.parse.urlsplit(endpoint).hostname}", flush=True)
+            # 官网 Cap widget 用空 POST；首次入口探测使用短超时。
+            ch = _json_request(s, "challenge", "challenge", base=endpoint,
+                               timeout=(min(3, _remaining()), min(6, _remaining())))
+            if not ch.get("token") or not isinstance(ch.get("challenge"), dict) or not ch.get("instrumentation"):
+                raise _EndpointError("challenge", "content", endpoint, detail="缺少 token/challenge/instrumentation")
+            return ch, endpoint
+        except _BudgetExceeded:
+            raise
+        except _EndpointError as error:
+            failures.append(error)
+            print(f"    · {_error_text(error)}", flush=True)
+    raise _CaptchaUnavailable(failures)
+
 def _register_one(email, password):
     last = None
     for attempt in range(1, RETRY + 1):
@@ -416,12 +478,9 @@ def _register_one(email, password):
         try:
             time.sleep(random.uniform(0.5, 1.5))
             with _new_session() as s:
-                s.headers.update({"User-Agent": _rand_ua(), "referer": BASE + "/",
-                                  "origin": BASE, "accept": "application/json"})
-                print("    · challenge: 请求验证码...", flush=True)
-                ch = _json_request(s, "/fd0fb2130e/challenge", "challenge", json={})
-                if not ch.get("token") or not isinstance(ch.get("challenge"), dict) or not ch.get("instrumentation"):
-                    raise RuntimeError("challenge: 缺少 token/challenge/instrumentation")
+                s.headers.update({"User-Agent": _rand_ua(), "referer": PANEL_BASE + "/",
+                                  "origin": PANEL_BASE, "accept": "application/json"})
+                ch, captcha_endpoint = _get_challenge(s)
                 print(f"    · pow: 计算 {ch['challenge'].get('c', '?')} 题...", flush=True)
                 sols = _solve_challenge(ch)
                 print("    · instr: 生成指纹...", flush=True)
@@ -430,10 +489,11 @@ def _register_one(email, password):
                 except Exception as ex:
                     raise RuntimeError(f"instr: {type(ex).__name__}") from None
                 print("    · redeem: 兑换令牌...", flush=True)
-                red = _json_request(s, "/fd0fb2130e/redeem", "redeem",
+                red = _json_request(s, "redeem", "redeem", base=captcha_endpoint,
                                     json={"token": ch["token"], "solutions": sols, "instr": instr})
                 if not red.get("success") or not red.get("token"):
-                    raise RuntimeError("redeem: 验证未通过")
+                    raise _EndpointError("redeem", "application", captcha_endpoint,
+                                         detail="服务器拒绝兑换，已执行 PoW/instrumentation；不是入口探测失败")
                 print("    · register: 提交注册...", flush=True)
                 rj = _json_request(s, "/api/v1/passport/auth/register", "register",
                                    data={"email": email, "password": password, "invite_code": "",
@@ -444,8 +504,8 @@ def _register_one(email, password):
                 token = data["token"]
                 return {"email": email, "password": password, "token": token,
                         "auth_data": data.get("auth_data"),
-                        "subscribe_url": f"https://windowsv1.com/s/?token={token}"}
-        except _BudgetExceeded:
+                        "subscribe_url": SUBSCRIBE_BASE + "/?" + urllib.parse.urlencode({"token": token})}
+        except (_BudgetExceeded, _CaptchaUnavailable):
             raise
         except Exception as ex:
             last = ex
@@ -706,10 +766,11 @@ def _fetch_nodes(token):
     yaml_text = None
     last_error = "订阅未下载"
     cfg = None
-    endpoints = [
-        ("https://main.wulavpn.com/s/", "main"),
-        ("https://windowsv1.com/s/", "legacy"),
-    ]
+    endpoints = [(SUBSCRIBE_BASE + "/", "primary")]
+    for url, label in [("https://main.wulavpn.com/s/", "main"),
+                       ("https://windowsv1.com/s/", "legacy")]:
+        if url not in [item[0] for item in endpoints]:
+            endpoints.append((url, label))
     for endpoint, label in endpoints:
         for attempt in range(2):
             try:
@@ -719,10 +780,15 @@ def _fetch_nodes(token):
                     r = s.get(endpoint, params={"token": token}, timeout=_timeout())
                     r.raise_for_status()
                     yaml_text = r.text
-                cfg = yaml.safe_load(yaml_text)
-                if not isinstance(cfg, dict) or not isinstance(cfg.get("proxies"), list):
+                candidate = yaml.safe_load(yaml_text)
+                if not isinstance(candidate, dict) or not isinstance(candidate.get("proxies"), list):
                     raise ValueError("订阅不是包含 proxies 的 Clash YAML")
+                if not candidate["proxies"]:
+                    raise ValueError("订阅 proxies 为空")
+                cfg = candidate
                 break
+            except _BudgetExceeded:
+                raise
             except Exception as ex:
                 last_error = f"subscription[{label}]: {type(ex).__name__}: {_error_text(ex)}"
                 if attempt == 0 and _remaining() > 5:
@@ -953,6 +1019,15 @@ def main():
         except _BudgetExceeded as ex:
             print(f"  ✗ {_error_text(ex)}", flush=True)
             break
+        except _CaptchaUnavailable as ex:
+            print(f"  ✗ {ex}", flush=True)
+            if not ex.retry_route:
+                print("[*] 验证码服务路由不可用；停止相同入口重试，保留账号缓存", flush=True)
+                break
+            if real >= min(max_attempts, max(1, int(os.environ.get("WULA_CAPTCHA_ROUTE_ATTEMPTS", "3")))):
+                print("[*] 验证码入口在多个出口均不可达，停止盲扫；本轮未进入指纹校验", flush=True)
+                break
+            continue
         except _Banned as ex:
             print(f"  ✗ 网络层失败: {_error_text(ex)}", flush=True)
             continue
