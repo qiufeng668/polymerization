@@ -38,7 +38,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install requests pyyaml
+      - run: python -m pip install requests pyyaml curl_cffi
       - name: Diagnose network without creating accounts or writing vault
         run: python -u wula_diagnose.py
 
