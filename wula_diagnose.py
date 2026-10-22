@@ -1,97 +1,117 @@
-"""Read-only CI network diagnosis. No registration; no token/node secrets in logs."""
-import importlib.util
+"""Read-only CI network diagnosis with repeated-attempt success rates.
+
+Distinguishes three hypotheses for the captcha host:
+  A) consistent block        -> every attempt fails
+  B) intermittent loss       -> some attempts succeed
+  C) TLS-layer interference  -> TCP ok but handshake fails consistently
+
+No registration, no redemption, no credentials in logs.
+"""
 import json
 import os
-from pathlib import Path
-import socket
-import time
 import platform
+import socket
 import ssl
-import requests
-import main_engine
+import time
 
-ROOT = Path(__file__).resolve().parent
+import requests
+
+ATTEMPTS = 5
+ORIGIN = '20.46.182.213'
+HOSTS = ['wulass.org', 'wula001.com']
+PANEL = 'main.wulavpn.com'
+
+
+def emit(kind, **kw):
+    print(kind, json.dumps(kw, ensure_ascii=False), flush=True)
+
+
+def egress():
+    for url in ('https://api.ipify.org', 'https://ifconfig.me/ip'):
+        try:
+            with requests.get(url, timeout=(4, 8)) as response:
+                return response.text.strip()
+        except Exception:
+            continue
+    return None
+
+
+def tcp(ip, timeout=4.0):
+    started = time.monotonic()
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout):
+            return 'ok', round((time.monotonic() - started) * 1000)
+    except Exception as error:
+        return type(error).__name__, round((time.monotonic() - started) * 1000)
+
+
+def tls(ip, sni, timeout=6.0):
+    context = ssl.create_default_context()
+    started = time.monotonic()
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=sni):
+                return 'ok', round((time.monotonic() - started) * 1000)
+    except Exception as error:
+        return type(error).__name__, round((time.monotonic() - started) * 1000)
+
+
+def challenge(host, timeout=9.0):
+    started = time.monotonic()
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.post(
+                'https://' + host + '/fd0fb2130e/challenge',
+                headers={'User-Agent': 'Mozilla/5.0', 'Origin': 'https://' + host},
+                timeout=(5, timeout))
+        elapsed = round((time.monotonic() - started) * 1000)
+        if response.status_code != 200:
+            return 'HTTP_%d' % response.status_code, elapsed
+        try:
+            payload = response.json()
+        except ValueError:
+            return 'bad_body', elapsed
+        complete = bool(payload.get('token') and payload.get('challenge') and payload.get('instrumentation'))
+        return ('complete' if complete else 'incomplete'), elapsed
+    except Exception as error:
+        return type(error).__name__, round((time.monotonic() - started) * 1000)
+
 
 def main():
-    print('runner',platform.system(),platform.machine(),'TLS',ssl.OPENSSL_VERSION,flush=True)
-    summary={'runner':platform.system(), 'challenge':False, 'subscription_nodes':0}
-    print('proxy environment variable names:', [k for k in os.environ if 'proxy' in k.lower()], flush=True)
-    for host in ('wula001.com', 'windowsv1.com'):
-        try:
-            print('DNS', host, sorted({i[4][0] for i in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)}), flush=True)
-        except Exception as ex:
-            print('DNS',host,type(ex).__name__, flush=True)
-    with requests.Session() as s:
-        s.trust_env=False
-        for host in ('wula001.com','windowsv1.com'):
-            try:
-                j=s.get('https://dns.google/resolve',params={'name':host,'type':'A'},timeout=(5,8)).json()
-                print('DoH',host,[i['data'] for i in j.get('Answer',[]) if i['type']==1],flush=True)
-            except Exception as ex:
-                print('DoH',host,type(ex).__name__,flush=True)
-        for url in ('https://www.gstatic.com/generate_204','https://wula001.com/','https://windowsv1.com/'):
-            t=time.monotonic()
-            try:
-                r=s.get(url,timeout=(8,8))
-                print('GET',url,r.status_code,'seconds',round(time.monotonic()-t,2),flush=True)
-            except Exception as ex:
-                print('GET',url,type(ex).__name__,'seconds',round(time.monotonic()-t,2),flush=True)
-        t=time.monotonic()
-        try:
-            r=s.post('https://wula001.com/fd0fb2130e/challenge',json={},timeout=(8,8))
-            j=r.json()
-            summary['challenge']=bool(r.ok and isinstance(j,dict) and j.get('token') and j.get('challenge') and j.get('instrumentation'))
-            print('challenge',r.status_code,'fields',list(j) if isinstance(j,dict) else 'invalid','seconds',round(time.monotonic()-t,2),flush=True)
-        except Exception as ex:
-            print('challenge',type(ex).__name__,'seconds',round(time.monotonic()-t,2),flush=True)
-    spec=importlib.util.spec_from_file_location('wula',ROOT/'plugins/wula.py')
-    w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
-    bank_path=ROOT/'vault_repo/wula_bank.json'
-    bank=json.loads(bank_path.read_text()) if bank_path.exists() else []
-    print('bank entries',len(bank),flush=True)
-    for i,account in enumerate(bank[:2]):
-        t=time.monotonic()
-        text,nodes,error=w._fetch_nodes(account.get('token',''))
-        print('subscription account',i,'nodes',len(nodes),'error',error,'seconds',round(time.monotonic()-t,2),flush=True)
-        summary['subscription_nodes']=max(summary['subscription_nodes'],len(nodes))
-        if nodes:
-            alive=main_engine.speedtest_modern_nodes(nodes)
-            print('subscription modern HTTPS verified',len(alive) if alive is not None else None,flush=True)
-            break
-    original_getaddrinfo=socket.getaddrinfo
-    for edge in ('104.21.1.1','172.67.1.1','104.16.132.229'):
-        def route(host,port,*args,**kwargs):
-            return original_getaddrinfo(edge if host in ('wula001.com','windowsv1.com') else host,port,*args,**kwargs)
-        socket.getaddrinfo=route
-        edge_ok=False
-        with requests.Session() as s:
-            s.trust_env=False
-            s.headers.update({'User-Agent':w._UAS[0],'referer':w.BASE+'/','origin':w.BASE})
-            try:
-                r=s.post(w.BASE+'/fd0fb2130e/challenge',json={},timeout=(5,10))
-                try:
-                    j=r.json()
-                except ValueError:
-                    j=None
-                edge_ok=bool(r.ok and isinstance(j,dict) and j.get('token') and j.get('challenge') and j.get('instrumentation'))
-                snippet=' '.join(r.text[:180].split())
-                print('EDGE',edge,'challenge',r.status_code,'ctype',r.headers.get('content-type'),'server',r.headers.get('server'),'complete',edge_ok,'body',snippet,flush=True)
-            except Exception as ex:
-                print('EDGE',edge,'challenge',type(ex).__name__,flush=True)
-            edge_nodes=0
-            if bank:
-                try:
-                    r=s.get('https://windowsv1.com/s/',params={'token':bank[0]['token']},headers={'User-Agent':'clash-verge/v1.3.8'},timeout=(5,10))
-                    cfg=__import__('yaml').safe_load(r.text)
-                    edge_nodes=len(cfg.get('proxies',[])) if isinstance(cfg,dict) else 0
-                    print('EDGE',edge,'subscription',r.status_code,'config rows',edge_nodes,flush=True)
-                except Exception as ex:
-                    print('EDGE',edge,'subscription',type(ex).__name__,flush=True)
-            if edge_ok and edge_nodes:
-                summary.update({'edge':edge,'edge_challenge':True,'edge_subscription_rows':edge_nodes})
-                break
-    socket.getaddrinfo=original_getaddrinfo
-    print('DIAG_SUMMARY',json.dumps(summary),flush=True)
+    emit('ENV', runner=platform.system(), machine=platform.machine(),
+         tls=ssl.OPENSSL_VERSION, proxy_vars=[k for k in os.environ if 'proxy' in k.lower()])
+    emit('EGRESS', ip=egress())
 
-if __name__=='__main__':
+    for host in HOSTS:
+        tcp_r, tls_r, http_r = [], [], []
+        for _ in range(ATTEMPTS):
+            kind, ms = tcp(ORIGIN)
+            tcp_r.append('%s/%dms' % (kind, ms))
+            kind, ms = tls(ORIGIN, host)
+            tls_r.append('%s/%dms' % (kind, ms))
+            kind, ms = challenge(host)
+            http_r.append('%s/%dms' % (kind, ms))
+            time.sleep(1.2)
+        emit('RATE', host=host, attempts=ATTEMPTS,
+             tcp=tcp_r, tls=tls_r, challenge=http_r,
+             tcp_ok=sum(1 for x in tcp_r if x.startswith('ok')),
+             tls_ok=sum(1 for x in tls_r if x.startswith('ok')),
+             challenge_ok=sum(1 for x in http_r if x.startswith('complete')))
+
+    # Control on the same runner: Cloudflare-fronted panel must stay stable.
+    control = []
+    for _ in range(3):
+        try:
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get('https://' + PANEL + '/api/v1/guest/comm/config',
+                                       timeout=(4, 8))
+            control.append('HTTP_%d' % response.status_code)
+        except Exception as error:
+            control.append(type(error).__name__)
+    emit('CONTROL', panel=control)
+
+
+if __name__ == '__main__':
     main()
