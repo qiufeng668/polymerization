@@ -695,28 +695,42 @@ def _rand_email_unique():
     return f"{_rand_email().split('@')[0]}{ts}@{random.choice(SUFFIXES)}"
 
 def _fetch_nodes(token):
-    """返回 (Clash YAML, URI列表, 错误)；下载/格式/空节点均视为失败。"""
+    """返回 (Clash YAML, URI列表, 错误)；下载/格式/空节点均视为失败。
+
+    订阅入口依次尝试（Runner 上旧域名 windowsv1.com 连不通，
+    但面板主域 main.wulavpn.com 的可达路径 /s/?token= 已实测可用）：
+    1) https://main.wulavpn.com/s/?token=…
+    2) https://windowsv1.com/s/?token=…（历史入口，保兼容）
+    """
     import yaml
     yaml_text = None
     last_error = "订阅未下载"
     cfg = None
-    for attempt in range(2):
-        try:
-            with _new_session() as s:
-                s.headers.update({"User-Agent": "clash-verge/v1.3.8", "accept": "*/*",
-                                  "referer": BASE + "/"})
-                r = s.get("https://windowsv1.com/s/", params={"token": token}, timeout=_timeout())
-                r.raise_for_status()
-                yaml_text = r.text
-            cfg = yaml.safe_load(yaml_text)
-            if not isinstance(cfg, dict) or not isinstance(cfg.get("proxies"), list):
-                raise ValueError("订阅不是包含 proxies 的 Clash YAML")
-            break
-        except Exception as ex:
-            last_error = f"subscription: {type(ex).__name__}: {_error_text(ex)}"
-            if attempt == 0 and _remaining() > 5:
-                time.sleep(1)
-    else:
+    endpoints = [
+        ("https://main.wulavpn.com/s/", "main"),
+        ("https://windowsv1.com/s/", "legacy"),
+    ]
+    for endpoint, label in endpoints:
+        for attempt in range(2):
+            try:
+                with _new_session() as s:
+                    s.headers.update({"User-Agent": "clash-verge/v1.3.8", "accept": "*/*",
+                                      "referer": BASE + "/"})
+                    r = s.get(endpoint, params={"token": token}, timeout=_timeout())
+                    r.raise_for_status()
+                    yaml_text = r.text
+                cfg = yaml.safe_load(yaml_text)
+                if not isinstance(cfg, dict) or not isinstance(cfg.get("proxies"), list):
+                    raise ValueError("订阅不是包含 proxies 的 Clash YAML")
+                break
+            except Exception as ex:
+                last_error = f"subscription[{label}]: {type(ex).__name__}: {_error_text(ex)}"
+                if attempt == 0 and _remaining() > 5:
+                    time.sleep(1)
+        else:
+            continue
+        break
+    if cfg is None:
         return yaml_text, [], last_error
     uris = []
     try:
