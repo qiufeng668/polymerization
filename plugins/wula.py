@@ -2,39 +2,60 @@
 # @interval: 12h   (Actions 自动跑, 每次注册 1 个账号)
 # -*- coding: utf-8 -*-
 """
-乌拉VPN (wula001.com) 批量自动注册 + 提取订阅链接  (自包含单文件版)
-# ============ 配置  ==== Tg == by_Jax ======
-依赖:
-    pip install requests   (仅此一个, 纯 Python 实现, 无需 Node.js)
-
-用法:
-    python3 wula.py 5          # 注册 5 个账号
-    python3 wula.py 10         # 注册 10 个账号
-    python3 wula.py 50         # 注册 50 个账号
-    python3 wula.py 5 --prefix myacc --password "Xx@123456" --threads 3
-
-输出:
-    accounts.json   JSON 格式
-    accounts.txt    每行: 邮箱 \t 密码 \t 订阅链接
+乌拉VPN：复用有效账号；无有效账号时注册一个，并验证订阅包含有效节点。
+原始 PoW / instrumentation 实现：By Jax / Tg by_Jax。
+Python 3.11+ | Deps: requests, pyyaml | Build: 无需编译
+Run: python3 plugins/wula.py --outdir output
+可选: --proxy http://127.0.0.1:7890 --password 自定义密码
+WULA_BUDGET_SECONDS 默认480秒；退出码0表示获得节点，2表示失败。
+输出 accounts.json、accounts.txt、nodes.txt、nodes.json、clash_all.yaml。
+账号及节点认证信息只写结果目录和私库，不打印到公开日志。
 """
 import json, time, sys, argparse, hashlib, os, random, string, re, base64, zlib, urllib.parse
-# 网络库: 有 curl_cffi 就用(可伪装 Chrome TLS), 没有就用标准库 requests(实测该站同样可用)
-try:
-    from curl_cffi import requests as _rq
-    _IMPERSONATE = "chrome"
-except ImportError:
-    import requests as _rq
-    _IMPERSONATE = None
+# 扫描与注册统一 requests / HTTP/1.1，避免两种 TLS 栈得出矛盾结果。
+import requests as _rq
+PROXY = None
+_DEADLINE = None
 
-PROXY = None   # 例: "http://127.0.0.1:7890" 或 "socks5://127.0.0.1:1080"
+class _BudgetExceeded(RuntimeError):
+    pass
+
+def _remaining():
+    return max(0.0, _DEADLINE - time.monotonic()) if _DEADLINE else 480.0
+
+def _check_budget():
+    if _remaining() < 1:
+        raise _BudgetExceeded("总时间预算已耗尽")
+
+def _timeout():
+    _check_budget()
+    return (min(5.0, _remaining()), min(20.0, _remaining()))
+
+def _error_text(ex):
+    text = str(ex)
+    text = re.sub(r'(?i)((?:token|password|auth_data|recaptcha_data)=)[^&\s\'"<>]+', r'\1[hidden]', text)
+    text = re.sub(r'(?i)(https?://)[^/@\s]+:[^/@\s]+@', r'\1[hidden]@', text)
+    return text[:240]
+
+def _json_request(s, path, stage, **kwargs):
+    try:
+        r = s.post(BASE + path, timeout=_timeout(), **kwargs)
+        r.raise_for_status()
+        value = r.json()
+        if not isinstance(value, dict):
+            raise ValueError("响应不是 JSON object")
+        return value
+    except _BudgetExceeded:
+        raise
+    except Exception as ex:
+        raise RuntimeError(f"{stage}: {type(ex).__name__}: {_error_text(ex)}") from None
 
 def _new_session():
-    if _IMPERSONATE:
-        s = _rq.Session(impersonate=_IMPERSONATE)
-    else:
-        s = _rq.Session()
+    s = _rq.Session()
+    # 有显式出口时屏蔽环境代理；否则保留运行环境的标准 HTTPS_PROXY。
+    s.trust_env = not bool(PROXY)
     if PROXY:
-        s.proxies = {"http": PROXY, "https": PROXY}
+        s.proxies.update({"http": PROXY, "https": PROXY})
     return s
 
 SUFFIXES = ["gmail.com", "qq.com", "163.com", "126.com", "outlook.com", "hotmail.com", "yahoo.com", "foxmail.com", "sina.com", "yeah.net",
@@ -82,6 +103,8 @@ def _solve_pow(salt, target):
     nbytes = len(tb)
     n = 0
     while True:
+        if n % 4096 == 0:
+            _check_budget()
         if hashlib.sha256((salt + str(n)).encode()).digest()[:nbytes] == tb:
             return n
         n += 1
@@ -310,7 +333,8 @@ def _is_burned(egress):
     if not egress:
         return False
     v = _load_burn().get(egress)
-    return bool(v and int(v.get("fails", 0)) >= 1)
+    # v1 把 timeout/SSL/邮箱冲突写成封禁；旧记录不再作为跳过依据。
+    return bool(v and v.get("confirmed") is True and int(v.get("fails", 0)) >= 1)
 
 # ---------------- 储备账号：新注册全失败时兜底 ----------------
 BANK_FALLBACK_ON = os.environ.get("WULA_BANK_FALLBACK", "1") != "0"
@@ -351,7 +375,9 @@ def _use_bank():
             bank = json.load(f)
     except Exception:
         return None
-    for entry in bank[:5]:
+    for entry in bank[:3]:
+        if not isinstance(entry, dict) or _remaining() < 10:
+            continue
         token = entry.get("token")
         if not token:
             continue
@@ -361,7 +387,7 @@ def _use_bank():
                 # 回写时间戳，把这条挪到最新
                 try:
                     bank.remove(entry)
-                    entry["ts"] = int(time.time())
+                    entry["last_checked"] = int(time.time())
                     bank.insert(0, entry)
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     with open(p, "w", encoding="utf-8") as f:
@@ -386,46 +412,48 @@ def _is_network_block(ex):
 def _register_one(email, password):
     last = None
     for attempt in range(1, RETRY + 1):
+        _check_budget()
         try:
-            time.sleep(random.uniform(0.5, 2.5))   # 请求抖动
-            s = _new_session()
-            s.headers.update({"User-Agent": _rand_ua(), "referer": BASE + "/",
-                              "origin": BASE, "accept": "application/json"})
-            print("    · 请求验证码...", flush=True)
-            ch = s.post(f"{BASE}/fd0fb2130e/challenge", json={}, timeout=30).json()
-            print(f"    · 计算 PoW (80题, 约10-60秒, 取决于设备)...", flush=True)
-            sols = _solve_challenge(ch)
             time.sleep(random.uniform(0.5, 1.5))
-            print("    · 生成浏览器指纹...", flush=True)
-            instr = _solve_instr(ch["instrumentation"])
-            print("    · 兑换令牌...", flush=True)
-            r = s.post(f"{BASE}/fd0fb2130e/redeem",
-                       json={"token": ch["token"], "solutions": sols, "instr": instr},
-                       timeout=30)
-            red = r.json()
-            if not red.get("success"):
-                raise RuntimeError(f"redeem 失败: {red}")
-            time.sleep(random.uniform(0.5, 1.5))
-            r = s.post(f"{BASE}/api/v1/passport/auth/register",
-                       data={"email": email, "password": password, "invite_code": "",
-                             "email_code": "", "recaptcha_data": red["token"]}, timeout=30)
-            rj = r.json()
-            data = rj.get("data")
-            if not data:
-                raise RuntimeError(f"注册失败: {rj}")
-            token = data["token"]
-            return {"email": email, "password": password, "token": token,
-                    "auth_data": data.get("auth_data"),
-                    "subscribe_url": f"https://windowsv1.com/s/?token={token}"}
-        except _Banned:
+            with _new_session() as s:
+                s.headers.update({"User-Agent": _rand_ua(), "referer": BASE + "/",
+                                  "origin": BASE, "accept": "application/json"})
+                print("    · challenge: 请求验证码...", flush=True)
+                ch = _json_request(s, "/fd0fb2130e/challenge", "challenge", json={})
+                if not ch.get("token") or not isinstance(ch.get("challenge"), dict) or not ch.get("instrumentation"):
+                    raise RuntimeError("challenge: 缺少 token/challenge/instrumentation")
+                print(f"    · pow: 计算 {ch['challenge'].get('c', '?')} 题...", flush=True)
+                sols = _solve_challenge(ch)
+                print("    · instr: 生成指纹...", flush=True)
+                try:
+                    instr = _solve_instr(ch["instrumentation"])
+                except Exception as ex:
+                    raise RuntimeError(f"instr: {type(ex).__name__}") from None
+                print("    · redeem: 兑换令牌...", flush=True)
+                red = _json_request(s, "/fd0fb2130e/redeem", "redeem",
+                                    json={"token": ch["token"], "solutions": sols, "instr": instr})
+                if not red.get("success") or not red.get("token"):
+                    raise RuntimeError("redeem: 验证未通过")
+                print("    · register: 提交注册...", flush=True)
+                rj = _json_request(s, "/api/v1/passport/auth/register", "register",
+                                   data={"email": email, "password": password, "invite_code": "",
+                                         "email_code": "", "recaptcha_data": red["token"]})
+                data = rj.get("data")
+                if not isinstance(data, dict) or not data.get("token"):
+                    raise RuntimeError("register: " + _error_text(rj.get("message", "缺少账号 token")))
+                token = data["token"]
+                return {"email": email, "password": password, "token": token,
+                        "auth_data": data.get("auth_data"),
+                        "subscribe_url": f"https://windowsv1.com/s/?token={token}"}
+        except _BudgetExceeded:
             raise
         except Exception as ex:
             last = ex
             if _is_network_block(ex):
-                raise _Banned(f"网络被拦截(疑似IP已进风控黑名单): {ex}")
-            if attempt < RETRY:
-                time.sleep(3 * attempt)
-    raise RuntimeError(f"重试{RETRY}次均失败: {last}")
+                raise _Banned(_error_text(ex)) from None
+            if attempt < RETRY and _remaining() > 10:
+                time.sleep(2)
+    raise RuntimeError(f"重试{RETRY}次均失败: {_error_text(last)}")
 
 # ---------------- 节点池轮换 (失败换节点重试) ----------------
 _NODE_PORT = 7899
@@ -667,50 +695,91 @@ def _rand_email_unique():
     return f"{_rand_email().split('@')[0]}{ts}@{random.choice(SUFFIXES)}"
 
 def _fetch_nodes(token):
-    """用 clash UA 拉订阅, 返回 (yaml_text, 节点URI列表, 原始b64)"""
+    """返回 (Clash YAML, URI列表, 错误)；下载/格式/空节点均视为失败。
+
+    订阅入口依次尝试（Runner 上旧域名 windowsv1.com 连不通，
+    但面板主域 main.wulavpn.com 的可达路径 /s/?token= 已实测可用）：
+    1) https://main.wulavpn.com/s/?token=…
+    2) https://windowsv1.com/s/?token=…（历史入口，保兼容）
+    """
     import yaml
-    s = _new_session()
-    s.headers.update({"User-Agent": "clash-verge/v1.3.8", "accept": "*/*",
-                      "referer": BASE + "/"})
-    try:
-        r = s.get(f"https://windowsv1.com/s/?token={token}", timeout=30)
-        yaml_text = r.text
-    except Exception as ex:
-        return None, [], str(ex)
+    yaml_text = None
+    last_error = "订阅未下载"
+    cfg = None
+    endpoints = [
+        ("https://main.wulavpn.com/s/", "main"),
+        ("https://windowsv1.com/s/", "legacy"),
+    ]
+    for endpoint, label in endpoints:
+        for attempt in range(2):
+            try:
+                with _new_session() as s:
+                    s.headers.update({"User-Agent": "clash-verge/v1.3.8", "accept": "*/*",
+                                      "referer": BASE + "/"})
+                    r = s.get(endpoint, params={"token": token}, timeout=_timeout())
+                    r.raise_for_status()
+                    yaml_text = r.text
+                cfg = yaml.safe_load(yaml_text)
+                if not isinstance(cfg, dict) or not isinstance(cfg.get("proxies"), list):
+                    raise ValueError("订阅不是包含 proxies 的 Clash YAML")
+                break
+            except Exception as ex:
+                last_error = f"subscription[{label}]: {type(ex).__name__}: {_error_text(ex)}"
+                if attempt == 0 and _remaining() > 5:
+                    time.sleep(1)
+        else:
+            continue
+        break
+    if cfg is None:
+        return yaml_text, [], last_error
     uris = []
     try:
-        cfg = yaml.safe_load(yaml_text)
         for p in cfg.get("proxies", []):
-            names = p.get("name", "")
-            if "剩余" in names or "到期" in names or "官网" in names or "套餐" in names:
+            if not isinstance(p, dict):
+                continue
+            names = str(p.get("name", ""))
+            if any(label in names for label in ("剩余", "到期", "官网", "套餐")):
                 continue
             pwd = str(p.get("password", p.get("uuid", "")))
             srv = str(p.get("server", ""))
-            port = p.get("port")
-            typ = p.get("type", "")
-            sni = p.get("sni", "")
-            if not srv or srv.startswith("127.") or "$" in names:
+            try:
+                port = int(p.get("port", 0))
+            except (ValueError, TypeError):
                 continue
-            if typ == "hysteria2" or typ == "hysteria":
-                u = f"hy2://{pwd}@{srv}:{port}?sni={sni}&insecure=1#{urllib.parse.quote(names)}"
+            typ = p.get("type", "")
+            sni = urllib.parse.quote(str(p.get("sni", p.get("servername", ""))), safe="")
+            if not srv or srv.startswith("127.") or srv in ("localhost", "::1", "0.0.0.0") or "$" in names or not 0 < port < 65536 or not pwd:
+                continue
+            if ":" in srv and not srv.startswith("["):
+                srv = f"[{srv}]"
+            auth = urllib.parse.quote(pwd, safe="")
+            alpn_value = p.get("alpn", [])
+            alpn = urllib.parse.quote(",".join(alpn_value) if isinstance(alpn_value, list) else str(alpn_value), safe="")
+            extra = f"&alpn={alpn}" if alpn else ""
+            if typ in ("hysteria2", "hy2"):
+                if p.get("obfs"):
+                    extra += "&" + urllib.parse.urlencode({"obfs": p["obfs"], "obfs-password": p.get("obfs-password", "")})
+                u = f"hy2://{auth}@{srv}:{port}?sni={sni}&insecure=1{extra}#{urllib.parse.quote(names)}"
             elif typ == "anytls":
-                u = (f"anytls://{pwd}@{srv}:{port}/?type=tcp&insecure=1"
-                     f"&fp={p.get('client-fingerprint','chrome')}&sni={sni}#{urllib.parse.quote(names)}")
+                u = (f"anytls://{auth}@{srv}:{port}/?type=tcp&insecure=1"
+                     f"&fp={p.get('client-fingerprint','chrome')}&sni={sni}{extra}#{urllib.parse.quote(names)}")
             elif typ == "ss":
                 raw = f"{p.get('cipher','aes-128-gcm')}:{pwd}".encode()
                 u = (f"ss://{base64.b64encode(raw).decode().rstrip('=')}"
                      f"@{srv}:{port}#{urllib.parse.quote(names)}")
             elif typ == "vless":
-                u = (f"vless://{pwd}@{srv}:{port}?encryption=none&security=tls"
+                u = (f"vless://{auth}@{srv}:{port}?encryption=none&security=tls"
                      f"&sni={sni}&fp={p.get('client-fingerprint','chrome')}"
                      f"&type={p.get('network','tcp')}#{urllib.parse.quote(names)}")
             elif typ == "trojan":
-                u = f"trojan://{pwd}@{srv}:{port}?sni={sni}&allowInsecure=1#{urllib.parse.quote(names)}"
+                u = f"trojan://{auth}@{srv}:{port}?sni={sni}&allowInsecure=1#{urllib.parse.quote(names)}"
             else:
-                u = f"{typ}://{srv}:{port}#{urllib.parse.quote(names)}"
+                continue
             uris.append(u)
-    except Exception:
-        pass
+    except Exception as ex:
+        return yaml_text, [], f"订阅解析失败: {type(ex).__name__}"
+    if not uris:
+        return yaml_text, [], "订阅中没有有效节点"
     return yaml_text, uris, None
 
 
@@ -722,7 +791,7 @@ def _save_results(accounts, save_dir, nodes_all):
     node_json_path = os.path.join(save_dir, "nodes.json")
     clash_path = os.path.join(save_dir, "clash_all.yaml")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, ensure_ascii=False, indent=2)
+        json.dump([{k: v for k, v in a.items() if not k.startswith("_pre_")} for a in accounts], f, ensure_ascii=False, indent=2)
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("========== 乌拉VPN 批量注册结果 ==========\n")
         f.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}  成功 {len(accounts)}\n\n")
@@ -747,7 +816,10 @@ def _save_results(accounts, save_dir, nodes_all):
     return txt_path, json_path, node_path, len(uniq)
 
 def main():
-    # 简化: 每次只注册 1 个账号 (批量注册功能已移除)
+    global PROXY, _DEADLINE
+    PROXY = None
+    _DEADLINE = time.monotonic() + max(30, min(540, int(os.environ.get("WULA_BUDGET_SECONDS", "480"))))
+    # 优先复用账号；只有没有有效订阅时才创建账号。
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--password", default=None, help="自定义密码 (默认随机)")
     ap.add_argument("--proxy", default=None,
@@ -766,13 +838,12 @@ def main():
                 _u = open(_boot).read().strip()
                 if _u:
                     args.proxy = _u
-                    print(f"[*] 检测到自举代理: {_u}")
+                    print("[*] 检测到自举代理（地址不写公开日志）")
             except Exception:
                 pass
     if args.proxy:
-        global PROXY
         PROXY = args.proxy
-        print(f"[*] 已启用代理出口: {args.proxy}\n")
+        print("[*] 已启用显式代理出口（日志隐藏地址）\n")
 
     accounts = []
     t0 = time.time()
@@ -780,9 +851,9 @@ def main():
 
     # ---------- 轮换节点重试：失败就换，直到成功 ----------
     pool = _load_node_pool()
-    if not pool:
-        # 池子为空 → 自己扫一遍（只影响本次运行，不影响别的插件）
-        pool = _auto_scan_pool()
+    initial_proxy = PROXY
+    # 先验证配置出口/直连；不在插件的600秒生命周期里再启动长扫描。
+    initial_pending = True
     tried = set()
     used_egress = set()
     max_attempts = int(os.environ.get("WULA_MAX_ATTEMPTS", "0")) or (len(pool) + 1 if pool else 1)
@@ -806,30 +877,49 @@ def main():
         return None
 
     acc = None
+    bank_used = False
+    if BANK_FALLBACK_ON:
+        hit = _use_bank()
+        if hit:
+            entry, pre_uris, pre_ytext = hit
+            accounts.append({**{k: v for k, v in entry.items() if k not in ("ts", "last_checked")},
+                             "node_count": len(pre_uris), "bank_fallback": True,
+                             "_pre_uris": pre_uris, "_pre_ytext": pre_ytext})
+            bank_used = True
+            print(f"[*] 已复用历史账号并重新下载验证 {len(pre_uris)} 个节点（非新注册）", flush=True)
     real = 0
     guard = 0
-    while real < max_attempts and guard < 4 * max_attempts + 10:
+    while not accounts and real < max_attempts and guard < 4 * max_attempts + 10:
+        if _remaining() < 25:
+            print("[*] 总预算接近耗尽，保留时间写入结果", flush=True)
+            break
         guard += 1
         args.proxy = None
         PROXY = None
         egress = None
-        if pool:
+        _stop_node_proxy()
+        if initial_pending:
+            initial_pending = False
+            real += 1
+            PROXY = initial_proxy
+            args.proxy = initial_proxy
+            print(f"\n[{real}/{max_attempts}] 优先验证: {'显式代理' if initial_proxy else '默认网络出口'}", flush=True)
+        elif pool:
             node = _pick_node()
             if node is not None:
                 tried.add(node.get("name"))
                 if _start_node_proxy(node, real + 1):
                     args.proxy = f"http://127.0.0.1:{_NODE_PORT}"
                     PROXY = args.proxy
-                    egress = _probe_egress(_NODE_PORT)
+                    egress = _probe_egress(_NODE_PORT, timeout=5)
                     if egress is None:
-                        print(f"  · 节点不通(出口探测失败)，跳过: {node['name'][:45]}", flush=True)
-                        _stop_node_proxy()
-                        continue
+                        print("  · 出口IP未知，继续以目标站实际请求判断可用性", flush=True)
                     if _is_burned(egress) or egress in used_egress:
                         print(f"  · 出口 {egress} 已烧/本轮已用 → 跳过 {node['name'][:45]}", flush=True)
                         _stop_node_proxy()
                         continue
-                    used_egress.add(egress)
+                    if egress:
+                        used_egress.add(egress)
                     real += 1
                     print(f"\n[{real}/{max_attempts}] 尝试: {node['name'][:45]}  (出口 {egress})", flush=True)
                 else:
@@ -842,35 +932,36 @@ def main():
                 print("[*] 池子里没有干净出口了，收工", flush=True)
                 break
         else:
-            real += 1
-            print(f"\n[{real}/{max_attempts}] 无节点池, 直连尝试", flush=True)
+            print("[*] 没有更多候选出口", flush=True)
+            break
 
         email = _rand_email_unique()
         pwd = args.password or _rand_password()
         try:
-            acc = _register_one(email, pwd)
-            _mark_used(email)
-            _save_bank(acc)
+            if acc is None:
+                acc = _register_one(email, pwd)
+                _mark_used(email)
+                _save_bank(acc)
+            print("    · subscription: 下载并校验节点...", flush=True)
+            ytext, uris, err = _fetch_nodes(acc["token"])
+            if err or not uris:
+                raise RuntimeError(f"注册成功但订阅不可用: {err or '空节点'}")
+            acc.update({"_pre_uris": uris, "_pre_ytext": ytext, "node_count": len(uris)})
             accounts.append(acc)
-            print(f"  [1/1] OK  {email}  密码:{pwd}", flush=True)
-            print(f"        {acc['subscribe_url']}", flush=True)
+            print(f"  [1/1] OK: 已注册并验证 {len(uris)} 个节点", flush=True)
+            break
+        except _BudgetExceeded as ex:
+            print(f"  ✗ {_error_text(ex)}", flush=True)
             break
         except _Banned as ex:
-            print(f"  ✗ {email} → 网络层失败: {str(ex)[:100]}", flush=True)
-            if egress:
-                _mark_burn(egress, str(ex))
+            print(f"  ✗ 网络层失败: {_error_text(ex)}", flush=True)
             continue
         except Exception as ex:
-            msg = str(ex)
-            print(f"  ✗ {email} → {msg[:100]}", flush=True)
-            # 软拒(邮箱已在系统中存在等) = 该出口被拉黑的另一种表现
-            if egress and ("存在" in msg or "already" in msg.lower()):
-                _mark_burn(egress, "soft-reject: " + msg)
-            time.sleep(random.uniform(2, 5))
+            print(f"  ✗ {_error_text(ex)}", flush=True)
+            time.sleep(1)
             continue
 
-    bank_used = False
-    if not accounts and BANK_FALLBACK_ON:
+    if not accounts and BANK_FALLBACK_ON and _remaining() > 15:
         print("\n[*] 新注册全失败 → 尝试储备账号兜底（历史成功注册的 wula 订阅，非新注册）", flush=True)
         hit = _use_bank()
         if hit:
@@ -940,10 +1031,12 @@ def main():
     print("=" * 50)
     for idx, a in enumerate(accounts, 1):
         print(f"\n[{idx}] 邮箱: {a['email']}")
-        print(f"    订阅: {a.get('subscribe_url', '')}")
+        print("    订阅: 已保存到结果文件（日志隐藏 token）")
         print(f"    节点: {a.get('node_count', 0)} 个 (已在 {node_path} 去重合并)")
     if stopped:
-        print(f"\n[!] 本次因疑似 IP 被拉黑而提前停止, 注册未完成。换 IP 后再跑。")
+        print("\n[!] 未获得有效节点，请按上述阶段错误诊断。")
+    if not uniq_n:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

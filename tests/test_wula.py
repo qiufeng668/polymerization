@@ -1,0 +1,188 @@
+"""Offline regression tests. Run: python3 -m unittest discover -s tests -v"""
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+import requests
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+w = load('wula_test_module', ROOT / 'plugins/wula.py')
+scanner = load('wula_scanner_test', ROOT / 'wula_node_scanner.py')
+engine = load('engine_test_module', ROOT / 'main_engine.py')
+SAMPLE = {'proxies': [
+    {'name': 'HY2 test', 'type': 'hysteria2', 'server': 'hy.example.com', 'port': 443, 'password': 'test-only', 'sni': 'hy.example.com'},
+    {'name': 'AnyTLS test', 'type': 'anytls', 'server': 'tls.example.com', 'port': 8443, 'password': 'a@b:c', 'sni': 'tls.example.com'}]}
+YAML_TEXT = yaml.safe_dump(SAMPLE)
+
+class WulaTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        for p in [patch.object(w, '_DEADLINE', None), patch.object(w, 'PROXY', None),
+                  patch.object(w, '_vault_dir', return_value=self.temp.name),
+                  patch.object(w.time, 'sleep')]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def fetch(self, text=YAML_TEXT, error=None):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        response = session.get.return_value
+        response.text = text
+        if error:
+            response.raise_for_status.side_effect = error
+        with patch.object(w, '_new_session', return_value=session):
+            result = w._fetch_nodes('fixture-token')
+        return result
+
+    def test_valid_subscription(self):
+        text, nodes, error = self.fetch()
+        self.assertIsNone(error)
+        self.assertEqual(len(nodes), 2)
+        self.assertTrue(nodes[0].startswith('hy2://'))
+        self.assertIn('a%40b%3Ac@', nodes[1])
+
+    def test_html_is_error(self):
+        self.assertTrue(self.fetch('<html>not YAML</html>')[2])
+
+    def test_empty_subscription_is_error(self):
+        self.assertTrue(self.fetch('proxies: []')[2])
+
+    def test_http_error_is_error_and_redacted(self):
+        error = requests.HTTPError('403 url: https://example.com/?token=fixture-secret')
+        result = self.fetch(error=error)
+        self.assertTrue(result[2])
+        self.assertNotIn('fixture-secret', result[2])
+
+    def test_invalid_nodes_are_rejected(self):
+        self.assertTrue(self.fetch(yaml.safe_dump({'proxies': [None, {},
+            {**SAMPLE['proxies'][0], 'server': '127.0.0.1'},
+            {**SAMPLE['proxies'][0], 'port': 70000}]}))[2])
+
+    def test_proxy_session_disables_environment_proxy(self):
+        with patch.object(w, 'PROXY', 'http://127.0.0.1:19999'):
+            with w._new_session() as s:
+                self.assertFalse(s.trust_env)
+                self.assertEqual(s.proxies['https'], w.PROXY)
+
+    def test_default_network_keeps_environment_proxy(self):
+        with w._new_session() as s:
+            self.assertTrue(s.trust_env)
+
+    def run_main(self, proxy_arg=None, proxy_env=None, fail=False):
+        acc = {'email': 'fixture@example.com', 'password': 'fixture-password', 'token': 'fixture-token'}
+        observed = []
+        def register(*args):
+            observed.append(w.PROXY)
+            if fail:
+                raise RuntimeError('fixture failure')
+            return acc.copy()
+        argv = ['wula.py', '--outdir', self.temp.name]
+        if proxy_arg:
+            argv += ['--proxy', proxy_arg]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(w.sys, 'argv', argv))
+            stack.enter_context(patch.dict(os.environ, {'WULA_MAX_ATTEMPTS': '1', 'WULA_PROXY': proxy_env or ''}))
+            for name, value in [('_load_node_pool', []), ('_use_bank', None), ('_save_bank', None),
+                                ('_mark_used', None), ('_stop_node_proxy', None)]:
+                stack.enter_context(patch.object(w, name, return_value=value))
+            stack.enter_context(patch.object(w, '_register_one', side_effect=register))
+            stack.enter_context(patch.object(w, '_fetch_nodes', return_value=(YAML_TEXT, ['hy2://fixture@hy.example.com:443#fixture'], None)))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            w.main()
+        return observed
+
+    def test_cli_proxy_preserved(self):
+        self.assertEqual(self.run_main(proxy_arg='http://127.0.0.1:19999'), ['http://127.0.0.1:19999'])
+
+    def test_environment_proxy_preserved(self):
+        self.assertEqual(self.run_main(proxy_env='http://127.0.0.1:19998'), ['http://127.0.0.1:19998'])
+
+    def test_failure_exits_nonzero(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_main(fail=True)
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_legacy_timeout_burn_not_trusted(self):
+        with patch.object(w, '_load_burn', return_value={'192.0.2.1': {'fails': 3}}):
+            self.assertFalse(w._is_burned('192.0.2.1'))
+
+    def test_budget_stops_pow(self):
+        with patch.object(w, '_DEADLINE', time.monotonic() - 1):
+            with self.assertRaises(w._BudgetExceeded):
+                w._solve_pow('fixture', 'ffff')
+
+    def test_scanner_cache_version_and_deep(self):
+        pool = Path(self.temp.name) / 'pool.json'
+        data = {'ts': time.time(), 'nodes': {'fixture': {}}, 'deep': True}
+        with patch.object(scanner, 'POOL_FILE', str(pool)):
+            pool.write_text(json.dumps(data))
+            self.assertFalse(scanner._pool_age_ok(3600, True)[0])
+            data['schema_version'] = scanner.SCHEMA_VERSION
+            pool.write_text(json.dumps(data))
+            self.assertTrue(scanner._pool_age_ok(3600, True)[0])
+            data['deep'] = False
+            pool.write_text(json.dumps(data))
+            self.assertFalse(scanner._pool_age_ok(3600, True)[0])
+
+    def test_engine_reads_wula_protocols(self):
+        nodes = ['hy2://fixture@hy.example.com:443#fixture', 'anytls://fixture@tls.example.com:8443/#fixture']
+        self.assertEqual(len(engine.extract_nodes_from_text('\n'.join(nodes))), 2)
+
+    def test_reuse_bank_does_not_register(self):
+        entry = {'email': 'fixture@example.com', 'password': 'fixture-password', 'token': 'fixture-token'}
+        argv = ['wula.py', '--outdir', self.temp.name]
+        with patch.object(w.sys, 'argv', argv), patch.dict(os.environ, {'WULA_PROXY': ''}), \
+             patch.object(w, '_load_node_pool', return_value=[]), \
+             patch.object(w, '_use_bank', return_value=(entry, ['anytls://fixture@tls.example.com:443#fixture'], YAML_TEXT)), \
+             patch.object(w, '_register_one') as register, contextlib.redirect_stdout(io.StringIO()):
+            w.main()
+            register.assert_not_called()
+        self.assertTrue((Path(self.temp.name) / 'nodes.txt').read_text().strip())
+
+    def test_modern_speedtest_missing_core_is_not_success(self):
+        with patch.object(engine.shutil, 'which', return_value=None), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(engine.speedtest_modern_nodes(['anytls://fixture@tls.example.com:443#fixture']))
+
+    def test_modern_speedtest_uses_controller_delay(self):
+        node = 'anytls://fixture@tls.example.com:443?alpn=h2%2Chttp%2F1.1#fixture'
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value.ok = True
+        session.get.return_value.json.return_value = {'delay': 120}
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch.object(engine.shutil, 'which', return_value='/fixture/mihomo'), \
+             patch.object(engine.subprocess, 'Popen', return_value=proc), \
+             patch.object(requests, 'Session', return_value=session), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(engine.speedtest_modern_nodes([node]), [node])
+        proc.terminate.assert_called_once()
+        proxy = engine.uri_to_clash_proxy(node)
+        self.assertEqual(proxy['alpn'], ['h2', 'http/1.1'])
+
+    def test_modern_speedtest_failed_delay_is_not_alive(self):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value.ok = True
+        session.get.return_value.json.return_value = {'message': 'Timeout'}
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch.object(engine.shutil, 'which', return_value='/fixture/mihomo'), \
+             patch.object(engine.subprocess, 'Popen', return_value=proc), \
+             patch.object(requests, 'Session', return_value=session), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(engine.speedtest_modern_nodes(['anytls://fixture@tls.example.com:443#fixture']), [])
+
+if __name__ == '__main__':
+    unittest.main()
