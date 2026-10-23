@@ -101,6 +101,17 @@ class Tests(unittest.TestCase):
                 self.assertIsNone(w._use_bank())
             fetch.assert_not_called()
 
+    def test_account_email_not_printed_to_public_log(self):
+        entry={'email':'fixture-private@example.com','password':'fixture-password','token':'fixture-token'}
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder)/'wula_bank.json').write_text(json.dumps([entry]))
+            buf=io.StringIO()
+            with patch.object(w,'_vault_dir',return_value=folder), \
+                 patch.object(w,'_bank_account_usable',return_value=(False,'套餐已到期或即将到期')), \
+                 contextlib.redirect_stdout(buf):
+                self.assertIsNone(w._use_bank())
+            self.assertNotIn('fixture-private@example.com',buf.getvalue())
+
     def test_unknown_panel_status_never_reuses_stale_subscription(self):
         entry={'email':'fixture@example.com','password':'fixture-password','token':'fixture-token'}
         with tempfile.TemporaryDirectory() as folder:

@@ -1116,7 +1116,7 @@ def main():
         if hit:
             entry, pre_uris, pre_ytext = hit
             age_h = round((time.time() - float(entry.get("ts") or 0)) / 3600, 1)
-            print(f"  ⚠️ 兜底: {entry.get('email')} ({age_h}h 前注册) → {len(pre_uris)} 节点", flush=True)
+            print(f"  ⚠️ 兜底: 历史账号 ({age_h}h 前注册) → {len(pre_uris)} 节点", flush=True)
             accounts.append({**{k: v for k, v in entry.items() if k != "ts"},
                              "node_count": len(pre_uris), "bank_fallback": True,
                              "_pre_uris": pre_uris, "_pre_ytext": pre_ytext})
@@ -1165,7 +1165,7 @@ def main():
             a["node_count"] = len(uris)
             nodes_all.extend(uris)
             clash_parts.append(ytext)
-            print(f"  [{idx}] {a['email']}: {len(uris)} 个节点")
+            print(f"  [{idx}] 账号来源: {'新注册' if not a.get('bank_fallback') else '缓存复用'}；节点数: {len(uris)}", flush=True)
 
     txt_path, json_path, node_path, uniq_n = _save_results(accounts, save_dir, nodes_all)
     if clash_parts:
@@ -1179,8 +1179,8 @@ def main():
         print("[!] 本次为储备账号兜底输出（历史注册账号的订阅），非新注册")
     print("=" * 50)
     for idx, a in enumerate(accounts, 1):
-        print(f"\n[{idx}] 邮箱: {a['email']}")
-        print("    订阅: 已保存到结果文件（日志隐藏 token）")
+        print(f"\n[{idx}] 来源: {'新注册' if not a.get('bank_fallback') else '缓存复用'}")
+        print("    订阅: 已保存到结果文件（日志隐藏 token 和账号）")
         print(f"    节点: {a.get('node_count', 0)} 个 (已在 {node_path} 去重合并)")
     if stopped:
         print("\n[!] 未获得有效节点，请按上述阶段错误诊断。")
