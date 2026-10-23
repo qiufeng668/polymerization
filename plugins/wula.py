@@ -423,8 +423,58 @@ def _save_bank(acc):
     except Exception as e:
         print(f"[!] 储备账号落盘失败: {e}", flush=True)
 
+def _bank_account_usable(entry):
+    """订阅端点可能给过期试用账号返回旧 YAML，以面板状态为准。"""
+    if not entry.get("email") or not entry.get("password"):
+        return False, "缺少账号凭据"
+    try:
+        with _new_session() as s:
+            s.headers.update({"User-Agent": _UAS[0], "origin": PANEL_BASE,
+                              "referer": PANEL_BASE + "/"})
+            login = _json_request(s, "/api/v1/passport/auth/login", "bank-login",
+                                  data={"email": entry["email"], "password": entry["password"]})
+            data = login.get("data")
+            auth = data.get("auth_data") if isinstance(data, dict) else None
+            if not isinstance(auth, str) or not auth:
+                return False, "登录未返回授权"
+            s.headers["Authorization"] = auth
+            response = s.get(PANEL_BASE + "/api/v1/user/info", timeout=_timeout(),
+                             allow_redirects=False)
+            try:
+                if not 200 <= response.status_code < 300:
+                    return False, f"账号状态 HTTP {response.status_code}"
+                body = response.json()
+                info = body.get("data") if isinstance(body, dict) else None
+                if not isinstance(info, dict):
+                    return False, "账号状态格式错误"
+                if not info.get("plan_id"):
+                    return False, "无有效套餐"
+                expires = info.get("expired_at")
+                if expires is None:
+                    return False, "缺少套餐到期时间"
+                try:
+                    if float(expires) <= time.time() + 3600:
+                        return False, "套餐已到期或即将到期"
+                except (TypeError, ValueError):
+                    return False, "套餐到期时间无效"
+                try:
+                    quota = int(info.get("transfer_enable") or 0)
+                    used = int(info.get("u") or 0) + int(info.get("d") or 0)
+                except (TypeError, ValueError):
+                    return False, "套餐流量信息无效"
+                if quota <= used:
+                    return False, "套餐流量已用尽"
+                return True, "账号有效"
+            finally:
+                response.close()
+    except _BudgetExceeded:
+        raise
+    except Exception as ex:
+        return False, f"面板暂时不可用: {type(ex).__name__}"
+
+
 def _use_bank():
-    """从储备账号里挑活的拉一次订阅验证。返回 (entry, uris, ytext) 或 None。"""
+    """先验证账号有效期与流量，再下载订阅；旧 YAML 不能冒充活号。"""
     p = _bank_path()
     if not os.path.exists(p):
         return None
@@ -438,6 +488,10 @@ def _use_bank():
             continue
         token = entry.get("token")
         if not token:
+            continue
+        usable, state = _bank_account_usable(entry)
+        if not usable:
+            print(f"[*] 缓存账号跳过: {state}", flush=True)
             continue
         try:
             ytext, uris, err = _fetch_nodes(token)
@@ -498,8 +552,11 @@ def _register_one(email, password):
             time.sleep(random.uniform(0.5, 1.5))
             # 浏览器指纹会话：验证码源站按首个请求的 TLS 指纹决定是否拉黑出口。
             with _new_session(browser=True) as s:
-                s.headers.update({"User-Agent": _rand_ua(), "referer": PANEL_BASE + "/",
-                                  "origin": PANEL_BASE, "accept": "application/json"})
+                # curl_cffi 的 Chrome TLS 指纹应配同款 UA，不能随机写 Firefox/Safari。
+                s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                                  "referer": PANEL_BASE + "/", "origin": PANEL_BASE,
+                                  "accept": "application/json"})
                 ch, captcha_endpoint = _get_challenge(s)
                 print(f"    · pow: 计算 {ch['challenge'].get('c', '?')} 题...", flush=True)
                 sols = _solve_challenge(ch)
@@ -964,8 +1021,10 @@ def main():
 
     acc = None
     bank_used = False
+    bank_checked = False
     if BANK_FALLBACK_ON:
         hit = _use_bank()
+        bank_checked = True
         if hit:
             entry, pre_uris, pre_ytext = hit
             accounts.append({**{k: v for k, v in entry.items() if k not in ("ts", "last_checked")},
@@ -1040,14 +1099,11 @@ def main():
             print(f"  ✗ {_error_text(ex)}", flush=True)
             break
         except _CaptchaUnavailable as ex:
-            print(f"  ✗ {ex}", flush=True)
-            if not ex.retry_route:
-                print("[*] 验证码服务路由不可用；停止相同入口重试，保留账号缓存", flush=True)
-                break
-            if real >= min(max_attempts, max(1, int(os.environ.get("WULA_CAPTCHA_ROUTE_ATTEMPTS", "3")))):
-                print("[*] 验证码入口在多个出口均不可达，停止盲扫；本轮未进入指纹校验", flush=True)
-                break
-            continue
+            print(f"  ✗ {_error_text(ex)}", flush=True)
+            if ex.retry_route and real < min(max_attempts, max(1, int(os.environ.get("WULA_CAPTCHA_ROUTE_ATTEMPTS", "3")))):
+                continue
+            print("[*] 验证码入口不可用；本轮没有注册账号", flush=True)
+            break
         except _Banned as ex:
             print(f"  ✗ 网络层失败: {_error_text(ex)}", flush=True)
             continue
@@ -1056,13 +1112,13 @@ def main():
             time.sleep(1)
             continue
 
-    if not accounts and BANK_FALLBACK_ON and _remaining() > 15:
+    if not accounts and BANK_FALLBACK_ON and not bank_checked and _remaining() > 15:
         print("\n[*] 新注册全失败 → 尝试储备账号兜底（历史成功注册的 wula 订阅，非新注册）", flush=True)
         hit = _use_bank()
         if hit:
             entry, pre_uris, pre_ytext = hit
             age_h = round((time.time() - float(entry.get("ts") or 0)) / 3600, 1)
-            print(f"  ⚠️ 兜底: {entry.get('email')} ({age_h}h 前注册) → {len(pre_uris)} 节点", flush=True)
+            print(f"  ⚠️ 兜底: 历史账号 ({age_h}h 前注册) → {len(pre_uris)} 节点", flush=True)
             accounts.append({**{k: v for k, v in entry.items() if k != "ts"},
                              "node_count": len(pre_uris), "bank_fallback": True,
                              "_pre_uris": pre_uris, "_pre_ytext": pre_ytext})
@@ -1111,7 +1167,7 @@ def main():
             a["node_count"] = len(uris)
             nodes_all.extend(uris)
             clash_parts.append(ytext)
-            print(f"  [{idx}] {a['email']}: {len(uris)} 个节点")
+            print(f"  [{idx}] 账号来源: {'新注册' if not a.get('bank_fallback') else '缓存复用'}；节点数: {len(uris)}", flush=True)
 
     txt_path, json_path, node_path, uniq_n = _save_results(accounts, save_dir, nodes_all)
     if clash_parts:
@@ -1125,8 +1181,8 @@ def main():
         print("[!] 本次为储备账号兜底输出（历史注册账号的订阅），非新注册")
     print("=" * 50)
     for idx, a in enumerate(accounts, 1):
-        print(f"\n[{idx}] 邮箱: {a['email']}")
-        print("    订阅: 已保存到结果文件（日志隐藏 token）")
+        print(f"\n[{idx}] 来源: {'新注册' if not a.get('bank_fallback') else '缓存复用'}")
+        print("    订阅: 已保存到结果文件（日志隐藏 token 和账号）")
         print(f"    节点: {a.get('node_count', 0)} 个 (已在 {node_path} 去重合并)")
     if stopped:
         print("\n[!] 未获得有效节点，请按上述阶段错误诊断。")
