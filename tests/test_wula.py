@@ -138,6 +138,16 @@ class WulaTests(unittest.TestCase):
             pool.write_text(json.dumps(data))
             self.assertFalse(scanner._pool_age_ok(3600, True)[0])
 
+    def test_wula_export_clears_old_files_when_source_is_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plain = Path(folder) / 'wula.txt'
+            encoded = Path(folder) / 'wula_base64.txt'
+            plain.write_text('hy2://stale@old.example:443#old\n')
+            encoded.write_text('c3RhbGU=')
+            self.assertEqual(engine.export_wula_only([], str(plain), str(encoded)), 0)
+            self.assertEqual(plain.read_text(), '')
+            self.assertEqual(encoded.read_text(), '')
+
     def test_wula_export_uses_raw_nodes_not_speed_filtered_nodes(self):
         all_nodes = [
             'anytls://secret-a@a.example:443/?sni=a.example#WuLa-A',
