@@ -941,48 +941,94 @@ def run_plugins_with_cache():
             all_raw_nodes.extend(cached_nodes)
             plugin_reports.append({"name": script_name, "interval": format_interval(interval_sec), "status": f"⏭️ 冷却中 ({last_status})", "count": len(cached_nodes), "fail_count": fail_count, "advice": "读取历史缓存"})
 
+    for report in plugin_reports:
+        info = state.get(report["name"], {})
+        report["last_success"] = info.get("last_success", "从未成功")
+        report["last_run"] = info.get("last_run", 0)
+        report["cached"] = report["status"].startswith("⏭️") or report["fail_count"] > 0
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     return all_raw_nodes, plugin_reports
 
-def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region_counters, plugin_reports):
-    dead_scripts = [p["name"] for p in plugin_reports if p["fail_count"] >= MAX_FAIL_STREAK]
+def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region_counters, plugin_reports, export_counts=None):
+    export_counts = export_counts or {}
+    failed_scripts = [p["name"] for p in plugin_reports if p["fail_count"] > 0]
+    cached_count = sum(p.get("cached", p["status"].startswith("⏭️") or p["fail_count"] > 0) for p in plugin_reports)
+    fresh_count = sum(p["status"].startswith("✅") and p["fail_count"] == 0 for p in plugin_reports)
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    run_number = os.environ.get("GITHUB_RUN_NUMBER", "-")
+    selected = os.environ.get("ONLY_PLUGINS", "").strip()
+    run_mode = ("定向刷新 " + selected) if selected else ("手动全量" if os.environ.get("MANUAL_RUN", "").lower() in ("1", "true", "yes") else "定时分频")
+    status = "🔴 无节点输出" if not alive_count else ("🟠 部分来源失败" if failed_scripts else "🟢 聚合产出正常")
+    repo = os.environ.get("GITHUB_REPOSITORY", "qiufeng668/polymerization")
+    run_link = f"https://github.com/{repo}/actions/runs/{run_id}" if run_id != "local" else ""
+    try:
+        with open(os.path.join(VAULT_DIR, "nodes_plain.txt"), encoding="utf-8") as handle:
+            output_count = sum(bool(line.strip()) for line in handle)
+    except OSError:
+        output_count = alive_count
     lines = [
-        "# 🚀 节点聚合中心 - 实时健康看板",
-        f"> **最后更新时间（北京时间）**：`{get_beijing_time()}`\n",
-        "## 📊 核心数据汇总",
-        "| 统计指标 | 数量 | 说明 |", "| :--- | :--- | :--- |",
-        f"| **📥 原始抓取总数** | `{raw_count} 条` | 所有脚本产出的未去重总和 |",
-        f"| **🔍 指纹深度去重** | `{unique_count} 条` | 剔除不同源重复节点后的数量 |",
-        f"| **🎯 真连接测速存活** | **`{alive_count} 条`** | 严格剔除超时及 0ms 的无效假节点 |",
-        f"| **⚔️ Clash 转换成功** | **`{clash_count} 条`** | 最终写入 `clash.yaml` (支持 VLESS Reality / Hy2) |", ""
+        "# 🛰️ 节点聚合中心",
+        f"> **{status}**  ·  更新于 `{get_beijing_time()}`  ·  [{run_number} / {run_id}]({run_link or '#'})  ·  `{run_mode}`",
+        "",
+        f"本轮 **{fresh_count}** 个来源新抓取，**{cached_count}** 个沿用缓存，**{len(failed_scripts)}** 个有失败记录。最终明文文件 **{output_count}** 行。",
+        "",
+        "## ⚡ 订阅文件",
+        "| 客户端 / 文件 | 入口 | 本轮节点 |",
+        "| :--- | :--- | ---: |",
+        f"| 明文节点 | [nodes_plain.txt](nodes_plain.txt) | {output_count} |",
+        f"| Base64 订阅 | [sub_base64.txt](sub_base64.txt) | {output_count} |",
+        f"| Clash / Mihomo | [clash.yaml](clash.yaml) | {clash_count} |",
+        f"| sing-box | [sing-box.json](sing-box.json) | {export_counts.get('singbox', '—')} |",
+        f"| Egern | [egern.yaml](egern.yaml) | {export_counts.get('egern', '—')} |",
+        f"| Surge / Surfboard | [surge.conf](surge.conf) | {export_counts.get('surge', '—')} |",
+        f"| 乌拉单源 | [wula.txt](wula.txt) / [Base64](wula_base64.txt) | {export_counts.get('wula', '—')} |",
+        "",
+        "## 📈 数据管线",
+        "| 阶段 | 节点数 |",
+        "| :--- | ---: |",
+        f"| 原始提取 | {raw_count} |",
+        f"| 指纹去重 | {unique_count} |",
+        f"| 最终筛选保留 | {alive_count} |",
+        f"| Clash 成品 | {clash_count} |",
+        "",
     ]
-    if dead_scripts:
-        lines.append("## 🚨 失效脚本下架提醒（重点关注！）")
-        lines.append(f"⚠️ 检测到以下 **{len(dead_scripts)}** 个脚本已连续失败满 {MAX_FAIL_STREAK} 次，系统已自动清空其旧缓存，请前往公开库 `plugins/` 目录检查或删除：")
-        for ds in dead_scripts: lines.append(f"- ❌ **`plugins/{ds}`** *(建议删除)*")
-        lines.append("")
-    lines.append("## 🧩 插件脚本健康度明细")
-    lines.append("| 脚本名称 | 设定周期 | 当前状态 | 贡献节点数 | 连续失败 | 诊断建议 |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+    if failed_scripts:
+        lines.extend([
+            "## ⚠️ 需要处理",
+            "有失败记录的来源：" + "、".join("`" + name + "`" for name in failed_scripts) + "。",
+            f"连续失败不足 {MAX_FAIL_STREAK} 次时沿用缓存，达到阈值后仅清除该来源缓存，不删除插件。",
+            "",
+        ])
+    lines.extend([
+        "## 插件健康度",
+        "| 插件 | 周期 | 本轮状态 | 节点 | 连败 | 上次成功 | 说明 |",
+        "| :--- | :--- | :--- | ---: | ---: | :--- | :--- |",
+    ])
     for p in plugin_reports:
-        lines.append(f"| `{p['name']}` | {p['interval']} | {p['status']} | **{p['count']}** 条 | {p['fail_count']} 次 | {p['advice']} |")
+        status_label = p['status']
+        if p.get('cached'):
+            status_label = '🟡 ' + status_label + '（缓存）'
+        success = p.get('last_success') or '从未成功'
+        advice = p['advice']
+        lines.append(f"| `{p['name']}` | {p['interval']} | {status_label} | {p['count']} | {p['fail_count']} | {success} | {advice} |")
     lines.append("")
     if region_counters:
-        lines.append("## 🌍 存活节点地区分布")
-        lines.append(" 、 ".join([f"**{k}**: `{v}条`" for k, v in sorted(region_counters.items(), key=lambda x: x[1], reverse=True)]))
+        lines.append("## 地区分布")
+        lines.append("、".join(f"**{k}** `{v}`" for k, v in sorted(region_counters.items(), key=lambda x: x[1], reverse=True)))
         lines.append("")
-    report_md = "\n".join(lines)
+    lines.append("> 账号、token、代理认证信息不写入此面板。")
+    report_md = "\n".join(lines) + "\n"
 
-    with open(os.path.join(VAULT_DIR, "README.md"), "w", encoding="utf-8") as f: f.write(report_md)
+    with open(os.path.join(VAULT_DIR, "README.md"), "w", encoding="utf-8") as f:
+        f.write(report_md)
     if summary_env := os.environ.get("GITHUB_STEP_SUMMARY"):
         try:
             with open(summary_env, "a", encoding="utf-8") as f: f.write(report_md + "\n")
         except Exception: pass
     print("\n" + "=" * 60)
-    print(f"📊 【本次聚合战报】 原始:{raw_count} -> 去重:{unique_count} -> 测速存活:{alive_count} -> Clash:{clash_count}")
-    if dead_scripts: print(f"🚨 【下架警告】 以下脚本已连续失效，建议从 plugins/ 中删除: {', '.join(dead_scripts)}")
-    else: print("✅ 【脚本健康】 所有启用中的脚本状态均正常！")
+    print(f"📊 聚合：原始 {raw_count} -> 去重 {unique_count} -> 存活 {alive_count} -> Clash {clash_count}")
+    print("⚠️ 有失败记录的插件：" + ", ".join(failed_scripts) if failed_scripts else "✅ 本轮无插件失败记录")
     print("=" * 60 + "\n")
 
 def speedtest_modern_nodes(nodes):
@@ -1191,7 +1237,8 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
                 with open(summary_env, "a", encoding="utf-8") as f: f.write(report_note)
             except Exception: pass
 
-    generate_dashboard(len(raw_nodes), len(unique_nodes), len(final_nodes), clash_count, region_counters, plugin_reports)
+    generate_dashboard(len(raw_nodes), len(unique_nodes), len(final_nodes), clash_count, region_counters, plugin_reports,
+                       {"egern": egern_count, "singbox": singbox_count, "surge": surge_count, "wula": wula_count})
     if os.environ.get("ONLY_PLUGINS", "").strip() == "wula.py" and not wula_count:
         raise RuntimeError("乌拉已下载订阅，但没有节点通过最终验证；停止同步私库")
 
