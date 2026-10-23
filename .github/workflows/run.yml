@@ -1,16 +1,15 @@
-name: Wula expired-cache recovery validation
+name: Wula ARM account refill handoff validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: wula-refill-sandbox
+  cancel-in-progress: false
 jobs:
-  expiry-recovery:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 6
+  arm-refill:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,18 +17,52 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/polymerization-1
+          ref: wula-refill-sandbox-20261023
           token: ${{ secrets.GIT_TOKEN }}
           path: vault_repo
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -r requirements.txt
-      - name: 'Exercise production path: expired cache -> Chrome registration -> subscription'
+      - run: python -m pip install requests pyyaml curl_cffi
+      - name: 'Prepare account on ARM and update only sandbox bank'
         env:
-          WULA_FORCE_REGISTER: '1'
-          WULA_BUDGET_SECONDS: '300'
-          WULA_MAX_ATTEMPTS: '1'
-        run: python -u plugins/wula.py --outdir /tmp/wula-expiry-output
-      - name: Assert one fresh registration and non-empty subscription
-        run: python wula_expiry_sandbox.py --assert-result
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: python wula_ensure.py --target-branch wula-refill-sandbox-20261023
+  aggregate-x86:
+    needs: arm-refill
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/polymerization-1
+          ref: wula-refill-sandbox-20261023
+          token: ${{ secrets.GIT_TOKEN }}
+          path: vault_repo
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install requests pyyaml curl_cffi
+      - name: 'Verify x86 reuses the ARM-created account and downloads nodes'
+        env:
+          WULA_FORCE_REGISTER: '0'
+          WULA_BUDGET_SECONDS: '150'
+        run: python plugins/wula.py --outdir /tmp/wula-x86-output
+      - name: Assert x86 reused the new account
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          out=Path('/tmp/wula-x86-output')
+          accounts=json.loads((out/'accounts.json').read_text())
+          nodes=[x for x in (out/'nodes.txt').read_text().splitlines() if x.strip()]
+          assert accounts and accounts[0].get('bank_fallback'), 'x86 did not reuse account bank'
+          assert len(nodes)>0, 'x86 subscription output is empty'
+          print('HANDOFF_OK cached_account_reused=1 nodes=%d' % len(nodes))
+          PY
+
