@@ -1,5 +1,6 @@
 """Offline regression tests. Run: python3 -m unittest discover -s tests -v"""
 import contextlib
+import base64
 import importlib.util
 import io
 import json
@@ -136,6 +137,89 @@ class WulaTests(unittest.TestCase):
             data['deep'] = False
             pool.write_text(json.dumps(data))
             self.assertFalse(scanner._pool_age_ok(3600, True)[0])
+
+    def test_full_aggregate_keeps_single_source_unfiltered(self):
+        raw=[]
+        for i in range(4):
+            raw.append('hy2://h%d@hy%d.example:443?sni=hy%d.example&insecure=1#wula HY2-%d'%(i,i,i,i))
+            raw.append('hysteria2://h%d@hy%d.example:443?sni=hy%d.example&insecure=1#wula HY2-%d'%(i,i,i,i))
+        for i in range(27):
+            raw.append('anytls://a%d@at%d.example:443/?sni=at%d.example#wula AnyTLS-%d'%(i,i,i,i))
+        plugin_reports=[{'name':'wula.py','interval':'12小时','status':'✅','count':35,'fail_count':0,'advice':'ok'}]
+        with tempfile.TemporaryDirectory() as folder:
+            with contextlib.ExitStack() as stack:
+                patches = [
+                    patch.object(engine,'VAULT_DIR',folder),
+                    patch.object(engine,'PRE_TEST_FILE',str(Path(folder)/'pre.txt')),
+                    patch.object(engine,'filter_dead_pairs',side_effect=lambda nodes:nodes),
+                    patch.object(engine,'speedtest_modern_nodes',return_value=[raw[-1]]),
+                    patch.object(engine,'export_clash_yaml',side_effect=lambda nodes,path:len(nodes)),
+                    patch.object(engine,'export_egern_yaml',side_effect=lambda nodes,path:len(nodes)),
+                    patch.object(engine,'export_singbox_json',side_effect=lambda nodes,path:len(nodes)),
+                    patch.object(engine,'export_surge_ini',side_effect=lambda nodes,path:len(nodes)),
+                    patch.object(engine,'upload_to_gist_backup',return_value=None),
+                    patch.object(engine,'generate_dashboard'),
+                ]
+                for ctx in patches:
+                    stack.enter_context(ctx)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                engine.deduplicate_and_speedtest(raw,plugin_reports)
+                aggregate=[x for x in (Path(folder)/'nodes_plain.txt').read_text().splitlines() if x.strip()]
+                single=[x for x in (Path(folder)/'wula.txt').read_text().splitlines() if x.strip()]
+                encoded=(Path(folder)/'wula_base64.txt').read_text()
+        self.assertEqual(len(aggregate),1)
+        self.assertEqual(len(single),31)
+        self.assertEqual(len(base64.b64decode(encoded).decode().splitlines()),31)
+        self.assertTrue(any('AnyTLS-0' in uri for uri in single))
+        self.assertTrue(any('HY2-0' in uri for uri in single))
+        self.assertIn('AnyTLS-26', aggregate[0])
+
+    def test_wula_export_clears_old_files_when_source_is_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plain = Path(folder) / 'wula.txt'
+            encoded = Path(folder) / 'wula_base64.txt'
+            plain.write_text('hy2://stale@old.example:443#old\n')
+            encoded.write_text('c3RhbGU=')
+            self.assertEqual(engine.export_wula_only([], str(plain), str(encoded)), 0)
+            self.assertEqual(plain.read_text(), '')
+            self.assertEqual(encoded.read_text(), '')
+
+    def test_wula_export_uses_raw_nodes_not_speed_filtered_nodes(self):
+        all_nodes = [
+            'anytls://secret-a@a.example:443/?sni=a.example#WuLa-A',
+            'anytls://secret-b@b.example:443/?sni=b.example#WuLa-B',
+            'hy2://secret-c@c.example:443?sni=c.example&insecure=1#WuLa-C',
+            'hysteria2://secret-c@c.example:443?sni=c.example&insecure=1#WuLa-C',
+            'vless://other@other.example:443#Other',
+        ]
+        final_speedtest_pass = [all_nodes[0]]
+        with tempfile.TemporaryDirectory() as folder:
+            plain = Path(folder) / 'wula.txt'
+            encoded = Path(folder) / 'wula_base64.txt'
+            count = engine.export_wula_only(all_nodes, str(plain), str(encoded))
+            lines = plain.read_text().splitlines()
+            self.assertEqual(count, 3)
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines, all_nodes[:3])
+            self.assertEqual(len(base64.b64decode(encoded.read_text()).decode().splitlines()), 3)
+            self.assertEqual(final_speedtest_pass, [all_nodes[0]])
+
+    def test_wula_export_deduplicates_repeated_endpoint_without_merging_different_nodes(self):
+        nodes = [
+            'hy2://secret-a@a.example:443?sni=a.example&insecure=1#wula WuLa-A',
+            'hysteria2://secret-a@a.example:443?sni=a.example&insecure=1#wula WuLa-A',
+            'hy2://secret-b@a.example:443?sni=a.example&insecure=1#wula WuLa-B',
+            'anytls://secret-a@a.example:443/?sni=a.example#wula WuLa-AT',
+            'trojan://secret-a@a.example:443?sni=a.example#Other',
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'wula.txt'
+            count = engine.export_wula_only(nodes, str(path))
+            self.assertEqual(count, 3)
+            exported = path.read_text().splitlines()
+            self.assertEqual(exported[0], nodes[0])
+            self.assertIn(nodes[2], exported)
+            self.assertIn(nodes[3], exported)
 
     def test_engine_reads_wula_protocols(self):
         nodes = ['hy2://fixture@hy.example.com:443#fixture', 'anytls://fixture@tls.example.com:8443/#fixture']

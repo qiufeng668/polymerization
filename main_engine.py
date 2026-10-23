@@ -636,20 +636,34 @@ def export_egern_yaml(final_nodes, out_path):
 GIST_DESC = "poly-sub-backup"
 GIST_FILENAME = "sub_base64.txt"
 
-def export_wula_only(final_nodes, out_path, out_path_b64=None):
-    """乌拉VPN 单独导出文件：按最终命名格式输出 / 单独订阅渠道"""
-    out = []
-    for uri in final_nodes:
-        if not re.search(r"wula", extract_original_name(uri), re.I): continue
+def _wula_raw_nodes(raw_nodes):
+    """Keep one URI per original Wula endpoint before the aggregate speed filter."""
+    out, seen = [], set()
+    for uri in raw_nodes:
+        if not re.search(r"wula", extract_original_name(uri), re.I):
+            continue
+        p = urlparse(uri)
+        # Clash YAML and nodes.txt represent the same HY2 endpoint as hysteria2:// and hy2://.
+        # Preserve the original URI in the export; normalize only the deduplication key.
+        scheme = "hy2" if p.scheme in ("hy2", "hysteria2") else p.scheme
+        key = (scheme, p.netloc, p.path, p.query) if scheme == "hy2" else get_node_fingerprint(uri)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(uri)
-    if not out:
-        print("ℹ️ wula 单独导出：0 条（本次无 wula 来源节点）")
-        return 0
-    with open(out_path, "w", encoding="utf-8") as f: f.write("\n".join(out) + "\n")
+    return out
+
+
+def export_wula_only(raw_nodes, out_path, out_path_b64=None):
+    """Wula single-source export: deduped source nodes, no speedtest filtering."""
+    out = _wula_raw_nodes(raw_nodes)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + ("\n" if out else ""))
     if out_path_b64:
         b64 = base64.b64encode("\n".join(out).encode("utf-8")).decode("utf-8")
-        with open(out_path_b64, "w", encoding="utf-8") as f: f.write(b64)
-    print(f"🦅 wula 单独导出：{len(out)} 条 → {out_path} (base64: {out_path_b64})")
+        with open(out_path_b64, "w", encoding="utf-8") as f:
+            f.write(b64)
+    print(f"🦅 wula 单独导出：{len(out)} 条（原始去重，未测速）→ {out_path}")
     return len(out)
 
 # ================= sing-box / Surge 导出 ==================
@@ -982,7 +996,7 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
         f"| sing-box | [sing-box.json](sing-box.json) | {export_counts.get('singbox', '—')} |",
         f"| Egern | [egern.yaml](egern.yaml) | {export_counts.get('egern', '—')} |",
         f"| Surge / Surfboard | [surge.conf](surge.conf) | {export_counts.get('surge', '—')} |",
-        f"| 乌拉单源 | [wula.txt](wula.txt) / [Base64](wula_base64.txt) | {export_counts.get('wula', '—')} |",
+        f"| 乌拉单源（完整，未测速） | [wula.txt](wula.txt) / [Base64](wula_base64.txt) | {export_counts.get('wula', '—')} |",
         "",
         "## 📈 数据管线",
         "| 阶段 | 节点数 |",
@@ -1126,6 +1140,9 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
 
     unique_nodes = filter_dead_pairs(unique_nodes)
     if not unique_nodes:
+        os.makedirs(VAULT_DIR, exist_ok=True)
+        export_wula_only(raw_nodes, os.path.join(VAULT_DIR, "wula.txt"),
+                         os.path.join(VAULT_DIR, "wula_base64.txt"))
         generate_dashboard(len(raw_nodes), 0, 0, 0, {}, plugin_reports)
         return
 
@@ -1226,7 +1243,7 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     egern_count = export_egern_yaml(final_nodes, os.path.join(VAULT_DIR, "egern.yaml"))
     singbox_count = export_singbox_json(final_nodes, os.path.join(VAULT_DIR, "sing-box.json"))
     surge_count = export_surge_ini(final_nodes, os.path.join(VAULT_DIR, "surge.conf"))
-    wula_count = export_wula_only(final_nodes, os.path.join(VAULT_DIR, "wula.txt"),
+    wula_count = export_wula_only(raw_nodes, os.path.join(VAULT_DIR, "wula.txt"),
                                   os.path.join(VAULT_DIR, "wula_base64.txt"))
     
     if gist_url := upload_to_gist_backup(b64_str):
