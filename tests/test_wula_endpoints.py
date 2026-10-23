@@ -40,6 +40,16 @@ class Tests(unittest.TestCase):
         self.assertTrue(all(call.args[0]==w.CAPTCHA_BASE+'/challenge' for call in session.post.call_args_list))
         self.assertTrue(all('json' not in call.kwargs for call in session.post.call_args_list))
 
+    def test_captcha_retries_three_transient_transport_failures_then_succeeds(self):
+        session=MagicMock();session.post.side_effect=[requests.exceptions.SSLError('one'),requests.exceptions.Timeout('two'),self.response(data=CH)]
+        with patch.object(w,'_DEADLINE',time.monotonic()+30),patch.object(w.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            challenge,endpoint=w._get_challenge(session)
+        self.assertEqual(challenge,CH)
+        self.assertEqual(endpoint,w.CAPTCHA_BASE)
+        self.assertEqual(session.post.call_count,3)
+        self.assertTrue(all(call.args[0]==w.CAPTCHA_BASE+'/challenge' for call in session.post.call_args_list))
+        self.assertTrue(all('json' not in call.kwargs for call in session.post.call_args_list))
+
     def test_captcha_does_not_retry_http_or_content_failure(self):
         session=MagicMock();session.post.return_value=self.response(404)
         with patch.object(w,'_DEADLINE',time.monotonic()+30),patch.object(w.time,'sleep'),contextlib.redirect_stdout(io.StringIO()),self.assertRaises(w._CaptchaUnavailable):

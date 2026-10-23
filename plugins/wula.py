@@ -531,10 +531,9 @@ def _get_challenge(s):
     _check_budget()
     print(f"    · challenge: {urllib.parse.urlsplit(endpoint).hostname}", flush=True)
     failures = []
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         try:
-            # Retry only a transport/handshake failure. Keep the same host and Chrome TLS
-            # fingerprint; never probe with requests or fall back to a sibling hostname.
+            # 官网 Cap widget 用空 POST；每次传输重试仍复用同一 Chrome TLS 会话。
             ch = _json_request(s, "challenge", "challenge", base=endpoint,
                                timeout=(min(3, _remaining()), min(6, _remaining())))
             break
@@ -542,9 +541,9 @@ def _get_challenge(s):
             raise
         except _EndpointError as error:
             failures.append(error)
-            if error.kind != "transport" or attempt == 2 or _remaining() < 8:
+            if error.kind != "transport" or attempt == 3 or _remaining() < 8:
                 raise _CaptchaUnavailable(failures)
-            print("    · challenge TLS/transport transient; retry once with same Chrome session", flush=True)
+            print(f"    · challenge TLS/transport transient; same Chrome session retry {attempt}/2", flush=True)
             time.sleep(0.5)
     else:
         raise _CaptchaUnavailable(failures)
