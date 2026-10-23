@@ -20,4 +20,7 @@ if a.assert_result:
     assert data, 'no account result record'
     fresh=[x for x in data if not x.get('bank_fallback')]
     assert fresh, 'run reused an expired cached account instead of registering'
-    print('SANDBOX_RESULT registered=%d nodes=%d'%(len(fresh),sum(bool(x.strip()) for x in nodes.read_text().splitlines())),flush=True)
+    saved=json.loads(bank.read_text())
+    assert saved and saved[0].get('token')==fresh[0].get('token'), 'new account not cached in runner vault'
+    assert time.time()-float(saved[0].get('ts') or 0)<300, 'cached account timestamp is stale'
+    print('SANDBOX_RESULT registered=%d nodes=%d new_account_cached=1'%(len(fresh),sum(bool(x.strip()) for x in nodes.read_text().splitlines())),flush=True)
