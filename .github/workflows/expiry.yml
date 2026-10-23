@@ -1,0 +1,29 @@
+name: Wula expired-cache recovery validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  expiry-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/polymerization-1
+          token: ${{ secrets.GIT_TOKEN }}
+          path: vault_repo
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt
+      - name: Prepare a temporary expired cache, never touch vault
+        run: python wula_expiry_sandbox.py --prepare
+      - name: 'Exercise production path: expired cache -> Chrome registration -> subscription'
+        run: python -u plugins/wula.py --outdir /tmp/wula-expiry-output
+      - name: Assert fresh account and non-empty nodes; no push
+        run: python wula_expiry_sandbox.py --assert-result

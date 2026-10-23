@@ -423,8 +423,58 @@ def _save_bank(acc):
     except Exception as e:
         print(f"[!] 储备账号落盘失败: {e}", flush=True)
 
+def _bank_account_usable(entry):
+    """订阅端点可能给过期试用账号返回旧 YAML，以面板状态为准。"""
+    if not entry.get("email") or not entry.get("password"):
+        return False, "缺少账号凭据"
+    try:
+        with _new_session() as s:
+            s.headers.update({"User-Agent": _UAS[0], "origin": PANEL_BASE,
+                              "referer": PANEL_BASE + "/"})
+            login = _json_request(s, "/api/v1/passport/auth/login", "bank-login",
+                                  data={"email": entry["email"], "password": entry["password"]})
+            data = login.get("data")
+            auth = data.get("auth_data") if isinstance(data, dict) else None
+            if not isinstance(auth, str) or not auth:
+                return False, "登录未返回授权"
+            s.headers["Authorization"] = auth
+            response = s.get(PANEL_BASE + "/api/v1/user/info", timeout=_timeout(),
+                             allow_redirects=False)
+            try:
+                if not 200 <= response.status_code < 300:
+                    return False, f"账号状态 HTTP {response.status_code}"
+                body = response.json()
+                info = body.get("data") if isinstance(body, dict) else None
+                if not isinstance(info, dict):
+                    return False, "账号状态格式错误"
+                if not info.get("plan_id"):
+                    return False, "无有效套餐"
+                expires = info.get("expired_at")
+                if expires is None:
+                    return False, "缺少套餐到期时间"
+                try:
+                    if float(expires) <= time.time() + 3600:
+                        return False, "套餐已到期或即将到期"
+                except (TypeError, ValueError):
+                    return False, "套餐到期时间无效"
+                try:
+                    quota = int(info.get("transfer_enable") or 0)
+                    used = int(info.get("u") or 0) + int(info.get("d") or 0)
+                except (TypeError, ValueError):
+                    return False, "套餐流量信息无效"
+                if quota <= used:
+                    return False, "套餐流量已用尽"
+                return True, "账号有效"
+            finally:
+                response.close()
+    except _BudgetExceeded:
+        raise
+    except Exception as ex:
+        return False, f"面板暂时不可用: {type(ex).__name__}"
+
+
 def _use_bank():
-    """从储备账号里挑活的拉一次订阅验证。返回 (entry, uris, ytext) 或 None。"""
+    """先验证账号有效期与流量，再下载订阅；旧 YAML 不能冒充活号。"""
     p = _bank_path()
     if not os.path.exists(p):
         return None
@@ -438,6 +488,10 @@ def _use_bank():
             continue
         token = entry.get("token")
         if not token:
+            continue
+        usable, state = _bank_account_usable(entry)
+        if not usable:
+            print(f"[*] 缓存账号跳过: {state}", flush=True)
             continue
         try:
             ytext, uris, err = _fetch_nodes(token)

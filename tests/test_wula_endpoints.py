@@ -1,5 +1,5 @@
 """Offline service separation/diagnostics. No network or registrations."""
-import contextlib,importlib.util,io,os,tempfile,time,unittest
+import contextlib,importlib.util,io,os,tempfile,time,unittest,json
 from pathlib import Path
 from unittest.mock import MagicMock,patch
 import requests,yaml
@@ -74,6 +74,56 @@ class Tests(unittest.TestCase):
         s=MagicMock();s.__enter__.return_value=s;s.get.return_value.text=yaml.safe_dump(CONFIG)
         with patch.object(w,'_new_session',return_value=s):text,nodes,error=w._fetch_nodes('fixture-token')
         self.assertIsNone(error);self.assertEqual(s.get.call_count,1)
+    def test_account_expiry_and_quota_use_panel_state(self):
+        entry={'email':'fixture@example.com','password':'fixture-password','token':'fixture-token'}
+        panel=MagicMock();panel.__enter__.return_value=panel
+        panel.post.return_value=self.response(data={'data':{'auth_data':'fixture-auth'}})
+        def verify(expiry, quota=1073741824, used=0):
+            panel.get.return_value=self.response(data={'data':{'expired_at':expiry,'plan_id':1,
+                                           'transfer_enable':quota,'u':used,'d':0}})
+            with patch.object(w,'_new_session',return_value=panel):
+                return w._bank_account_usable(entry)
+        self.assertEqual(verify(time.time()-60)[0],False)
+        self.assertEqual(verify(None)[0],False)
+        self.assertEqual(verify(time.time()+1800)[0],False)
+        self.assertEqual(verify(time.time()+7200)[0],True)
+        self.assertEqual(verify(time.time()+7200,quota=10,used=10)[0],False)
+        self.assertNotIn('fixture-auth',str(verify(time.time()+7200)))
+
+    def test_expired_bank_entry_is_never_used_even_if_old_subscription_works(self):
+        entry={'email':'fixture@example.com','password':'fixture-password','token':'fixture-token'}
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'wula_bank.json';path.write_text(json.dumps([entry]))
+            with patch.object(w,'_vault_dir',return_value=folder), \
+                 patch.object(w,'_bank_account_usable',return_value=(False,'套餐已到期或即将到期')), \
+                 patch.object(w,'_fetch_nodes',return_value=(yaml.safe_dump(CONFIG),['hy2://stale@old.example:443#old'],None)) as fetch, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(w._use_bank())
+            fetch.assert_not_called()
+
+    def test_unknown_panel_status_never_reuses_stale_subscription(self):
+        entry={'email':'fixture@example.com','password':'fixture-password','token':'fixture-token'}
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder)/'wula_bank.json').write_text(json.dumps([entry]))
+            with patch.object(w,'_vault_dir',return_value=folder), \
+                 patch.object(w,'_bank_account_usable',return_value=(False,'面板暂时不可用: TimeoutError')), \
+                 patch.object(w,'_fetch_nodes',return_value=(yaml.safe_dump(CONFIG),['hy2://stale@old.example:443#old'],None)) as fetch, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(w._use_bank())
+            fetch.assert_not_called()
+
+    def test_active_bank_entry_is_validated_before_subscription(self):
+        entry={'email':'fixture@example.com','password':'fixture-password','token':'fixture-token'}
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'wula_bank.json';path.write_text(json.dumps([entry]))
+            with patch.object(w,'_vault_dir',return_value=folder), \
+                 patch.object(w,'_bank_account_usable',return_value=(True,'账号有效')), \
+                 patch.object(w,'_fetch_nodes',return_value=(yaml.safe_dump(CONFIG),['hy2://fresh@new.example:443#fresh'],None)) as fetch, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                hit=w._use_bank()
+            self.assertIsNotNone(hit);self.assertEqual(hit[1],['hy2://fresh@new.example:443#fresh'])
+            fetch.assert_called_once_with('fixture-token')
+
     def test_endpoint_configuration_rejects_credentials_and_query(self):
         for url in ('http://a.example','https://u:p@a.example','https://a.example/?token=x'):
             with self.assertRaises(ValueError):w._https_endpoint(url,'fixture')
