@@ -530,14 +530,24 @@ def _get_challenge(s):
     endpoint = CAPTCHA_BASE
     _check_budget()
     print(f"    · challenge: {urllib.parse.urlsplit(endpoint).hostname}", flush=True)
-    try:
-        # 官网 Cap widget 用空 POST；首次入口探测使用短超时。
-        ch = _json_request(s, "challenge", "challenge", base=endpoint,
-                           timeout=(min(3, _remaining()), min(6, _remaining())))
-    except _BudgetExceeded:
-        raise
-    except _EndpointError as error:
-        raise _CaptchaUnavailable([error])
+    failures = []
+    for attempt in range(1, 3):
+        try:
+            # Retry only a transport/handshake failure. Keep the same host and Chrome TLS
+            # fingerprint; never probe with requests or fall back to a sibling hostname.
+            ch = _json_request(s, "challenge", "challenge", base=endpoint,
+                               timeout=(min(3, _remaining()), min(6, _remaining())))
+            break
+        except _BudgetExceeded:
+            raise
+        except _EndpointError as error:
+            failures.append(error)
+            if error.kind != "transport" or attempt == 2 or _remaining() < 8:
+                raise _CaptchaUnavailable(failures)
+            print("    · challenge TLS/transport transient; retry once with same Chrome session", flush=True)
+            time.sleep(0.5)
+    else:
+        raise _CaptchaUnavailable(failures)
     if not ch.get("token") or not isinstance(ch.get("challenge"), dict) or not ch.get("instrumentation"):
         raise _CaptchaUnavailable([
             _EndpointError("challenge", "content", endpoint,
