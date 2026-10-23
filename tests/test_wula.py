@@ -164,6 +164,23 @@ class WulaTests(unittest.TestCase):
         self.assertEqual(saved[0]['token'], 'fixture-new')
         self.assertIn('fresh@hy.example.com', (Path(self.temp.name) / 'nodes.txt').read_text())
 
+    def test_force_register_skips_valid_cached_account(self):
+        existing = {'email':'old@example.com','password':'old-password','token':'old-token'}
+        fresh = {'email':'fresh@example.com','password':'fresh-password','token':'new-token'}
+        (Path(self.temp.name) / 'wula_bank.json').write_text(json.dumps([existing]))
+        argv = ['wula.py', '--outdir', self.temp.name]
+        with patch.object(w.sys, 'argv', argv), patch.dict(os.environ, {'WULA_FORCE_REGISTER':'1','WULA_MAX_ATTEMPTS':'1','WULA_PROXY':''}), \
+             patch.object(w, '_load_node_pool', return_value=[]), patch.object(w, '_use_bank') as bank, \
+             patch.object(w, '_register_one', return_value=fresh) as register, \
+             patch.object(w, '_mark_used'), patch.object(w, '_stop_node_proxy'), \
+             patch.object(w, '_fetch_nodes', return_value=(YAML_TEXT,['hy2://fresh@hy.example.com:443#fresh'],None)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            w.main()
+        bank.assert_not_called()
+        register.assert_called_once()
+        saved=json.loads((Path(self.temp.name)/'wula_bank.json').read_text())
+        self.assertEqual(saved[0]['token'],'new-token')
+
     def test_reuse_bank_does_not_register(self):
         entry = {'email': 'fixture@example.com', 'password': 'fixture-password', 'token': 'fixture-token'}
         argv = ['wula.py', '--outdir', self.temp.name]

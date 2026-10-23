@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+        runner: [ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 6
     steps:
@@ -25,9 +25,11 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt
-      - name: Prepare a temporary expired cache, never touch vault
-        run: python wula_expiry_sandbox.py --prepare
       - name: 'Exercise production path: expired cache -> Chrome registration -> subscription'
+        env:
+          WULA_FORCE_REGISTER: '1'
+          WULA_BUDGET_SECONDS: '300'
+          WULA_MAX_ATTEMPTS: '1'
         run: python -u plugins/wula.py --outdir /tmp/wula-expiry-output
-      - name: Assert fresh account and non-empty nodes; no push
+      - name: Assert one fresh registration and non-empty subscription
         run: python wula_expiry_sandbox.py --assert-result

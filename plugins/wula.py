@@ -1030,8 +1030,11 @@ def main():
 
     acc = None
     bank_used = False
-    bank_checked = False
-    if BANK_FALLBACK_ON:
+    force_register = os.environ.get("WULA_FORCE_REGISTER", "") == "1"
+    bank_checked = force_register
+    if force_register:
+        print("[*] WULA_FORCE_REGISTER=1：本轮跳过缓存账号，强制注册一个新账号", flush=True)
+    if BANK_FALLBACK_ON and not force_register:
         hit = _use_bank()
         bank_checked = True
         if hit:
