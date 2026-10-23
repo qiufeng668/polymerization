@@ -61,15 +61,16 @@ def main():
     wula.PROXY = None
     wula._DEADLINE = time.monotonic() + 210
     usable = False
-    if not a.force_new:
-        for entry in rows[:3]:
-            ok, reason = wula._bank_account_usable(entry)
-            print("BANK_CHECK", "active" if ok else reason, flush=True)
-            if ok:
-                hit = wula._use_bank()
-                if hit:
-                    print("REFILL_SKIP active_account=1", flush=True)
-                    return 0
+    if not a.force_new and rows:
+        newest = max((float(x.get("ts") or 0) for x in rows if isinstance(x, dict)), default=0)
+        # One-day trial: renew at 20h, leaving time for another scheduled attempt.
+        if newest and time.time() - newest < 20 * 3600:
+            hit = wula._use_bank()
+            if hit:
+                print("REFILL_SKIP active_account=1", flush=True)
+                return 0
+        else:
+            print("BANK_RENEW newest_account_age_hours=%.1f" % ((time.time()-newest)/3600), flush=True)
 
     print("REFILL_START registering_one=1", flush=True)
     env = os.environ.copy()

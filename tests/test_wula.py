@@ -1,5 +1,6 @@
 """Offline regression tests. Run: python3 -m unittest discover -s tests -v"""
 import contextlib
+import base64
 import importlib.util
 import io
 import json
@@ -136,6 +137,43 @@ class WulaTests(unittest.TestCase):
             data['deep'] = False
             pool.write_text(json.dumps(data))
             self.assertFalse(scanner._pool_age_ok(3600, True)[0])
+
+    def test_wula_export_uses_raw_nodes_not_speed_filtered_nodes(self):
+        all_nodes = [
+            'anytls://secret-a@a.example:443/?sni=a.example#WuLa-A',
+            'anytls://secret-b@b.example:443/?sni=b.example#WuLa-B',
+            'hy2://secret-c@c.example:443?sni=c.example&insecure=1#WuLa-C',
+            'hysteria2://secret-c@c.example:443?sni=c.example&insecure=1#WuLa-C',
+            'vless://other@other.example:443#Other',
+        ]
+        final_speedtest_pass = [all_nodes[0]]
+        with tempfile.TemporaryDirectory() as folder:
+            plain = Path(folder) / 'wula.txt'
+            encoded = Path(folder) / 'wula_base64.txt'
+            count = engine.export_wula_only(all_nodes, str(plain), str(encoded))
+            lines = plain.read_text().splitlines()
+            self.assertEqual(count, 3)
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines, all_nodes[:3])
+            self.assertEqual(len(base64.b64decode(encoded.read_text()).decode().splitlines()), 3)
+            self.assertEqual(final_speedtest_pass, [all_nodes[0]])
+
+    def test_wula_export_deduplicates_repeated_endpoint_without_merging_different_nodes(self):
+        nodes = [
+            'hy2://secret-a@a.example:443?sni=a.example&insecure=1#wula WuLa-A',
+            'hysteria2://secret-a@a.example:443?sni=a.example&insecure=1#wula WuLa-A',
+            'hy2://secret-b@a.example:443?sni=a.example&insecure=1#wula WuLa-B',
+            'anytls://secret-a@a.example:443/?sni=a.example#wula WuLa-AT',
+            'trojan://secret-a@a.example:443?sni=a.example#Other',
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'wula.txt'
+            count = engine.export_wula_only(nodes, str(path))
+            self.assertEqual(count, 3)
+            exported = path.read_text().splitlines()
+            self.assertEqual(exported[0], nodes[0])
+            self.assertIn(nodes[2], exported)
+            self.assertIn(nodes[3], exported)
 
     def test_engine_reads_wula_protocols(self):
         nodes = ['hy2://fixture@hy.example.com:443#fixture', 'anytls://fixture@tls.example.com:8443/#fixture']
