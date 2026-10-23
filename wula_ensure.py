@@ -33,9 +33,22 @@ def load_rows(path):
         return []
 
 
+def merge_registered_account(rows, account, now=None):
+    """Keep the plugin's persisted timestamp when available; otherwise assign one."""
+    now = int(time.time() if now is None else now)
+    token = account.get("token")
+    cached = next((x for x in rows if isinstance(x, dict) and x.get("token") == token), None)
+    entry = dict(cached or account)
+    entry.setdefault("ts", now)
+    entry["ts"] = int(entry.get("ts") or now)
+    merged = [entry] + [x for x in rows if not isinstance(x, dict) or x.get("token") != token]
+    return merged[:10]
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--target-branch", required=True)
+    p.add_argument("--force-new", action="store_true", help="sandbox only: exercise fresh account handoff")
     a = p.parse_args()
     vault = ROOT / "vault_repo"
     vault.mkdir(exist_ok=True)
@@ -48,20 +61,23 @@ def main():
     wula.PROXY = None
     wula._DEADLINE = time.monotonic() + 210
     usable = False
-    for entry in rows[:3]:
-        ok, reason = wula._bank_account_usable(entry)
-        print("BANK_CHECK", "active" if ok else reason, flush=True)
-        if ok:
-            hit = wula._use_bank()
-            if hit:
-                print("REFILL_SKIP active_account=1", flush=True)
-                return 0
+    if not a.force_new:
+        for entry in rows[:3]:
+            ok, reason = wula._bank_account_usable(entry)
+            print("BANK_CHECK", "active" if ok else reason, flush=True)
+            if ok:
+                hit = wula._use_bank()
+                if hit:
+                    print("REFILL_SKIP active_account=1", flush=True)
+                    return 0
 
     print("REFILL_START registering_one=1", flush=True)
     env = os.environ.copy()
     env["WULA_FORCE_REGISTER"] = "1"
     env["WULA_BUDGET_SECONDS"] = "210"
     env["WULA_MAX_ATTEMPTS"] = "1"
+    if a.force_new:
+        env["WULA_FORCE_REGISTER"] = "1"
     result = subprocess.run([sys.executable, str(ROOT / "plugins/wula.py"),
                              "--outdir", "/tmp/wula-arm-output"],
                             cwd=ROOT, env=env, timeout=230)
@@ -75,8 +91,7 @@ def main():
     created = [x for x in json.loads(accounts.read_text()) if x.get("token") and not x.get("bank_fallback")]
     assert len(created) == 1, "expected exactly one newly registered account"
     rows = load_rows(bank)
-    rows = [created[0]] + [x for x in rows if x.get("token") != created[0]["token"]]
-    rows = rows[:10]
+    rows = merge_registered_account(rows, created[0])
     bank.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
     print("REFILL_VERIFIED registered=1 nodes=%d" % sum(bool(x.strip()) for x in nodes.read_text().splitlines()), flush=True)
 
@@ -104,7 +119,8 @@ def main():
     verify = s.get(file_url, params={"ref": a.target_branch}, timeout=(5, 18)); verify.raise_for_status()
     checked = json.loads(base64.b64decode(verify.json()["content"]))
     assert checked[0].get("token") == created[0]["token"], "fresh account absent on target branch"
-    print("REFILL_REMOTE_VERIFIED entries=%d" % len(checked), flush=True)
+    assert 0 <= time.time() - float(checked[0].get("ts") or 0) < 300, "new account timestamp missing or stale"
+    print("REFILL_REMOTE_VERIFIED entries=%d fresh_timestamp=1" % len(checked), flush=True)
 
 
 if __name__ == "__main__":

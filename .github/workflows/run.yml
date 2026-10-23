@@ -28,7 +28,7 @@ jobs:
       - name: 'Prepare account on ARM and update only sandbox bank'
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
-        run: python wula_ensure.py --target-branch wula-refill-sandbox-20261023
+        run: python wula_ensure.py --target-branch wula-refill-sandbox-20261023 --force-new
   aggregate-x86:
     needs: arm-refill
     runs-on: ubuntu-latest
