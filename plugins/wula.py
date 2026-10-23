@@ -552,8 +552,11 @@ def _register_one(email, password):
             time.sleep(random.uniform(0.5, 1.5))
             # 浏览器指纹会话：验证码源站按首个请求的 TLS 指纹决定是否拉黑出口。
             with _new_session(browser=True) as s:
-                s.headers.update({"User-Agent": _rand_ua(), "referer": PANEL_BASE + "/",
-                                  "origin": PANEL_BASE, "accept": "application/json"})
+                # curl_cffi 的 Chrome TLS 指纹应配同款 UA，不能随机写 Firefox/Safari。
+                s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                                  "referer": PANEL_BASE + "/", "origin": PANEL_BASE,
+                                  "accept": "application/json"})
                 ch, captcha_endpoint = _get_challenge(s)
                 print(f"    · pow: 计算 {ch['challenge'].get('c', '?')} 题...", flush=True)
                 sols = _solve_challenge(ch)
@@ -1018,8 +1021,10 @@ def main():
 
     acc = None
     bank_used = False
+    bank_checked = False
     if BANK_FALLBACK_ON:
         hit = _use_bank()
+        bank_checked = True
         if hit:
             entry, pre_uris, pre_ytext = hit
             accounts.append({**{k: v for k, v in entry.items() if k not in ("ts", "last_checked")},
@@ -1094,14 +1099,11 @@ def main():
             print(f"  ✗ {_error_text(ex)}", flush=True)
             break
         except _CaptchaUnavailable as ex:
-            print(f"  ✗ {ex}", flush=True)
-            if not ex.retry_route:
-                print("[*] 验证码服务路由不可用；停止相同入口重试，保留账号缓存", flush=True)
-                break
-            if real >= min(max_attempts, max(1, int(os.environ.get("WULA_CAPTCHA_ROUTE_ATTEMPTS", "3")))):
-                print("[*] 验证码入口在多个出口均不可达，停止盲扫；本轮未进入指纹校验", flush=True)
-                break
-            continue
+            print(f"  ✗ {_error_text(ex)}", flush=True)
+            if ex.retry_route and real < min(max_attempts, max(1, int(os.environ.get("WULA_CAPTCHA_ROUTE_ATTEMPTS", "3")))):
+                continue
+            print("[*] 验证码入口不可用；本轮没有注册账号", flush=True)
+            break
         except _Banned as ex:
             print(f"  ✗ 网络层失败: {_error_text(ex)}", flush=True)
             continue
@@ -1110,7 +1112,7 @@ def main():
             time.sleep(1)
             continue
 
-    if not accounts and BANK_FALLBACK_ON and _remaining() > 15:
+    if not accounts and BANK_FALLBACK_ON and not bank_checked and _remaining() > 15:
         print("\n[*] 新注册全失败 → 尝试储备账号兜底（历史成功注册的 wula 订阅，非新注册）", flush=True)
         hit = _use_bank()
         if hit:
