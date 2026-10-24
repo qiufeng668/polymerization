@@ -415,7 +415,8 @@ def _save_bank(acc):
     bank.insert(0, {"email": acc.get("email"), "password": acc.get("password"),
                     "token": acc.get("token"), "subscribe_url": acc.get("subscribe_url"),
                     "ts": int(time.time())})
-    bank = bank[:10]
+    # 乌拉账号约 24h 到期；多账号同时注册只会同时过期，只保留当前账号。
+    bank = bank[:1]
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
@@ -1098,12 +1099,13 @@ def main():
             if acc is None:
                 acc = _register_one(email, pwd)
                 _mark_used(email)
-                _save_bank(acc)
             print("    · subscription: 下载并校验节点...", flush=True)
             ytext, uris, err = _fetch_nodes(acc["token"])
             if err or not uris:
+                # 新账号只有订阅验证成功后才替换私库当前账号。
                 raise RuntimeError(f"注册成功但订阅不可用: {err or '空节点'}")
             acc.update({"_pre_uris": uris, "_pre_ytext": ytext, "node_count": len(uris)})
+            _save_bank(acc)
             accounts.append(acc)
             print(f"  [1/1] OK: 已注册并验证 {len(uris)} 个节点", flush=True)
             break
