@@ -1,96 +1,32 @@
-name: Auto Multi-Sub Aggregator
-
+name: Wula single-account rollover validation
 on:
-  schedule:
-    - cron: '*/50 * * * *'
   workflow_dispatch:
-    inputs:
-      wula_only:
-        description: '只刷新乌拉，其它插件沿用缓存；不勾选则全量运行'
-        type: boolean
-        default: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: aggregator-private-vault
-  cancel-in-progress: false
-
 jobs:
-  build-and-sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  rollover:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
     steps:
-      - name: 1. 检出公开库正式代码
-        uses: actions/checkout@v4
-
-      - name: 2. 检出私有订阅库
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/polymerization-1
           token: ${{ secrets.GIT_TOKEN }}
           path: vault_repo
-
-      - name: 3. 配置 Python
-        uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 安装生产依赖
-        run: python -m pip install -r requirements.txt
-
-      - name: 乌拉离线回归（不访问验证码服务）
+      - run: python -m pip install -r requirements.txt
+      - name: Run offline regression tests
         run: python -m unittest discover -s tests -p 'test_wula*.py' -q
-
-      - name: 4. 下载 LiteSpeedTest 和 mihomo
-        run: |
-          curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 -o lite.gz https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz
-          gunzip -f lite.gz
-          chmod +x lite
-          MI_VER="v1.19.32"
-          if curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 -o mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MI_VER}/mihomo-linux-amd64-compatible-${MI_VER}.gz" && gunzip -f mihomo.gz; then
-            chmod +x mihomo
-            sudo mv mihomo /usr/local/bin/mihomo
-            mihomo -v
-          else
-            echo "WARNING: mihomo 下载失败，按主控现有降级逻辑继续"
-          fi
-
-      # 不在注册前运行 requests/urllib 验证码探测，避免污染首个 TLS 请求。
-      - name: 5. 运行聚合主控（手动全量，定时遵循插件冷却）
+      - name: Execute production Wula plugin against current expired bank
         env:
-          PYTHONUNBUFFERED: '1'
-          MANUAL_RUN: "${{ github.event_name == 'workflow_dispatch' }}"
-          WULA_ONLY: "${{ inputs.wula_only }}"
-          WULA_MAX_ATTEMPTS: '8'
-          WULA_BUDGET_SECONDS: '480'
-        run: |
-          if [ "$WULA_ONLY" = "true" ]; then
-            ONLY_PLUGINS=wula.py python -u -c 'import main_engine as m; nodes,reports=m.run_plugins_with_cache(); assert any(r["name"]=="wula.py" and r["fail_count"]==0 and r["count"]>0 for r in reports), "乌拉本次未产出有效节点"; m.deduplicate_and_speedtest(nodes,reports)'
-          else
-            python -u main_engine.py
-          fi
-
-      - name: 校验聚合输出不是空文件
-        run: |
-          test -s vault_repo/nodes_plain.txt
-          test -s vault_repo/sub_base64.txt
-          test -s vault_repo/clash.yaml
-          python -c 'from pathlib import Path; p=Path("vault_repo/nodes_plain.txt"); print("正式输出非空行数:",sum(bool(x.strip()) for x in p.read_text().splitlines()))'
-
-      - name: 6. 推送聚合结果到私库
-        working-directory: vault_repo
-        run: |
-          git config user.name "AggregatorBot"
-          git config user.email "bot@noreply.github.com"
-          git checkout --orphan new_main
-          git add .
-          if git diff --cached --quiet; then
-            echo "没有需要同步的结果"
-            exit 0
-          fi
-          NODE_COUNT=$(python -c 'from pathlib import Path; print(sum(bool(x.strip()) for x in Path("nodes_plain.txt").read_text().splitlines()))')
-          git commit -m "Auto sync: $(date -u +'%Y-%m-%d %H:%M:%S UTC') (nodes: ${NODE_COUNT})"
-          git push --force-with-lease origin new_main:main
-          echo "聚合结果已推送私库"
+          WULA_BUDGET_SECONDS: '300'
+          WULA_MAX_ATTEMPTS: '1'
+        run: python -u plugins/wula.py --outdir /tmp/wula-rollover-output
+      - name: Assert one fresh account, one bank entry, and nodes
+        run: python wula_rollover_assert.py

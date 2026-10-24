@@ -30,6 +30,32 @@ class Tests(unittest.TestCase):
     def test_budget_not_swallowed_as_transport(self):
         with patch.object(w,'_DEADLINE',time.monotonic()-1),self.assertRaises(w._BudgetExceeded):
             w._json_request(MagicMock(),'challenge','challenge')
+    def test_captcha_retries_transient_tls_once_without_changing_host_or_fingerprint(self):
+        session=MagicMock();session.post.side_effect=[requests.ConnectTimeout('transient'),self.response(data=CH)]
+        with patch.object(w,'_DEADLINE',time.monotonic()+30),patch.object(w.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            challenge,endpoint=w._get_challenge(session)
+        self.assertEqual(challenge,CH)
+        self.assertEqual(endpoint,w.CAPTCHA_BASE)
+        self.assertEqual(session.post.call_count,2)
+        self.assertTrue(all(call.args[0]==w.CAPTCHA_BASE+'/challenge' for call in session.post.call_args_list))
+        self.assertTrue(all('json' not in call.kwargs for call in session.post.call_args_list))
+
+    def test_captcha_retries_three_transient_transport_failures_then_succeeds(self):
+        session=MagicMock();session.post.side_effect=[requests.exceptions.SSLError('one'),requests.exceptions.Timeout('two'),self.response(data=CH)]
+        with patch.object(w,'_DEADLINE',time.monotonic()+30),patch.object(w.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            challenge,endpoint=w._get_challenge(session)
+        self.assertEqual(challenge,CH)
+        self.assertEqual(endpoint,w.CAPTCHA_BASE)
+        self.assertEqual(session.post.call_count,3)
+        self.assertTrue(all(call.args[0]==w.CAPTCHA_BASE+'/challenge' for call in session.post.call_args_list))
+        self.assertTrue(all('json' not in call.kwargs for call in session.post.call_args_list))
+
+    def test_captcha_does_not_retry_http_or_content_failure(self):
+        session=MagicMock();session.post.return_value=self.response(404)
+        with patch.object(w,'_DEADLINE',time.monotonic()+30),patch.object(w.time,'sleep'),contextlib.redirect_stdout(io.StringIO()),self.assertRaises(w._CaptchaUnavailable):
+            w._get_challenge(session)
+        self.assertEqual(session.post.call_count,1)
+
     def test_captcha_uses_single_route_and_empty_post(self):
         # 两个验证码域名同源同 IP；首个请求失败即已封禁，回退只会加深封禁。
         s=MagicMock();s.post.return_value=self.response(data=CH)

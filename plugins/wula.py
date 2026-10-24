@@ -415,7 +415,8 @@ def _save_bank(acc):
     bank.insert(0, {"email": acc.get("email"), "password": acc.get("password"),
                     "token": acc.get("token"), "subscribe_url": acc.get("subscribe_url"),
                     "ts": int(time.time())})
-    bank = bank[:10]
+    # 乌拉账号约 24h 到期；多账号同时注册只会同时过期，只保留当前账号。
+    bank = bank[:1]
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
@@ -530,14 +531,23 @@ def _get_challenge(s):
     endpoint = CAPTCHA_BASE
     _check_budget()
     print(f"    · challenge: {urllib.parse.urlsplit(endpoint).hostname}", flush=True)
-    try:
-        # 官网 Cap widget 用空 POST；首次入口探测使用短超时。
-        ch = _json_request(s, "challenge", "challenge", base=endpoint,
-                           timeout=(min(3, _remaining()), min(6, _remaining())))
-    except _BudgetExceeded:
-        raise
-    except _EndpointError as error:
-        raise _CaptchaUnavailable([error])
+    failures = []
+    for attempt in range(1, 4):
+        try:
+            # 官网 Cap widget 用空 POST；每次传输重试仍复用同一 Chrome TLS 会话。
+            ch = _json_request(s, "challenge", "challenge", base=endpoint,
+                               timeout=(min(3, _remaining()), min(6, _remaining())))
+            break
+        except _BudgetExceeded:
+            raise
+        except _EndpointError as error:
+            failures.append(error)
+            if error.kind != "transport" or attempt == 3 or _remaining() < 8:
+                raise _CaptchaUnavailable(failures)
+            print(f"    · challenge TLS/transport transient; same Chrome session retry {attempt}/2", flush=True)
+            time.sleep(0.5)
+    else:
+        raise _CaptchaUnavailable(failures)
     if not ch.get("token") or not isinstance(ch.get("challenge"), dict) or not ch.get("instrumentation"):
         raise _CaptchaUnavailable([
             _EndpointError("challenge", "content", endpoint,
@@ -1021,8 +1031,11 @@ def main():
 
     acc = None
     bank_used = False
-    bank_checked = False
-    if BANK_FALLBACK_ON:
+    force_register = os.environ.get("WULA_FORCE_REGISTER", "") == "1"
+    bank_checked = force_register
+    if force_register:
+        print("[*] WULA_FORCE_REGISTER=1：本轮跳过缓存账号，强制注册一个新账号", flush=True)
+    if BANK_FALLBACK_ON and not force_register:
         hit = _use_bank()
         bank_checked = True
         if hit:
@@ -1086,12 +1099,13 @@ def main():
             if acc is None:
                 acc = _register_one(email, pwd)
                 _mark_used(email)
-                _save_bank(acc)
             print("    · subscription: 下载并校验节点...", flush=True)
             ytext, uris, err = _fetch_nodes(acc["token"])
             if err or not uris:
+                # 新账号只有订阅验证成功后才替换私库当前账号。
                 raise RuntimeError(f"注册成功但订阅不可用: {err or '空节点'}")
             acc.update({"_pre_uris": uris, "_pre_ytext": ytext, "node_count": len(uris)})
+            _save_bank(acc)
             accounts.append(acc)
             print(f"  [1/1] OK: 已注册并验证 {len(uris)} 个节点", flush=True)
             break
