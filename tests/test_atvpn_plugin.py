@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parent
-spec=importlib.util.spec_from_file_location('atvpn_plugin',ROOT/'plugins/atvpn.py')
+PLUGIN = ROOT / 'plugins/atvpn.py' if (ROOT / 'plugins/atvpn.py').exists() else ROOT.parent / 'plugins/atvpn.py'
+spec=importlib.util.spec_from_file_location('atvpn_plugin',PLUGIN)
 atvpn=importlib.util.module_from_spec(spec);spec.loader.exec_module(atvpn)
 
 class AtvpnPluginTests(unittest.TestCase):
