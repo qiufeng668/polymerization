@@ -16,3 +16,20 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install requests pyyaml
       - run: python -m unittest tests/test_atvpn_plugin.py -v
+      - name: 'Run one real ATVPN registration on GitHub'
+        run: |
+          rm -rf /tmp/atvpn-output
+          python plugins/atvpn.py --outdir /tmp/atvpn-output
+      - name: 'Assert one subscription link and non-empty plain nodes'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          out = Path('/tmp/atvpn-output')
+          links = [x.strip() for x in (out / 'subscription.txt').read_text().splitlines() if x.strip()]
+          nodes = [x.strip() for x in (out / 'nodes.txt').read_text().splitlines() if x.strip()]
+          assert len(links) == 1 and re.match(r'^https://', links[0]), 'subscription.txt must contain one HTTPS link'
+          assert nodes, 'nodes.txt is empty'
+          assert all('://' in node for node in nodes), 'nodes.txt contains non-URI output'
+          print('ATVPN_LIVE_OK links=1 nodes=%d' % len(nodes))
+          PY
