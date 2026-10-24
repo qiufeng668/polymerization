@@ -1134,7 +1134,13 @@ def deduplicate_and_speedtest(raw_nodes, plugin_reports):
     unique_map = {}
     for uri in raw_nodes:
         if fp := get_node_fingerprint(uri):
-            if fp not in unique_map: unique_map[fp] = uri
+            # ATVPN advertises multiple named entries on the same server/credential.
+            # Preserve its distinct labels; all other sources retain normal endpoint dedupe.
+            name = extract_original_name(uri)
+            is_atvpn = name.lower().startswith("atvpn")
+            key = (fp, name) if is_atvpn else fp
+            if key not in unique_map:
+                unique_map[key] = uri
     unique_nodes = list(unique_map.values())
     print(f"🔍 汇总总数: {len(raw_nodes)} | 指纹深度去重后: {len(unique_nodes)} 条")
 
