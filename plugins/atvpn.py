@@ -178,7 +178,8 @@ def decode_subscription(body):
     compact = re.sub(r'\s+', '', body) + '=' * (-len(re.sub(r'\s+', '', body)) % 4)
     try:
         decoded = base64.b64decode(compact, validate=True).decode('utf-8')
-        lines = [line.strip() for line in decoded.splitlines() if is_node_link(line.strip())]
+        lines = [line.strip() for line in decoded.splitlines()
+                 if is_node_link(line.strip()) and not _is_ad_uri(line.strip())]
         if lines:
             return lines
     except (ValueError, UnicodeError):
