@@ -67,11 +67,33 @@ def _quote(value):
     return up.quote(str(value), safe='')
 
 
+def _is_ad_name(value):
+    name = str(value or '')
+    return bool(re.search(r'[@＠][A-Za-z0-9_]+|最新节点|TG频道|Telegram|官方群|官网地址', name, re.I))
+
+
+def _is_ad_uri(uri):
+    if uri.startswith('vmess://'):
+        try:
+            encoded = uri[8:].split('#', 1)[0]
+            value = json.loads(base64.b64decode(encoded + '=' * (-len(encoded) % 4)).decode())
+            return _is_ad_name(value.get('ps'))
+        except (ValueError, UnicodeError):
+            return False
+    return _is_ad_name(up.unquote(up.urlsplit(uri).fragment))
+
+
+def _clean_name(value):
+    return str(value or '').strip() or 'ATVPN'
+
+
 def _node_uri(proxy):
     if not isinstance(proxy, dict):
         raise ValueError('proxy is not object')
     kind = str(proxy.get('type', '')).lower()
-    name = str(proxy.get('name', 'ATVPN'))
+    name = _clean_name(proxy.get('name', 'ATVPN'))
+    if not name.lower().startswith('atvpn'):
+        name = 'atvpn ' + name
     host = str(proxy.get('server', '')).strip()
     port = int(proxy.get('port', 0))
     secret = str(proxy.get('uuid') or proxy.get('password') or '')
@@ -150,15 +172,16 @@ def decode_subscription(body):
     body = (body or '').lstrip('\ufeff').strip()
     if not body:
         return []
-    lines = [line.strip() for line in body.splitlines() if is_node_link(line.strip())]
+    lines = [line.strip() for line in body.splitlines() if is_node_link(line.strip()) and not _is_ad_uri(line.strip())]
     if lines:
-        return list(dict.fromkeys(lines))
+        return lines
     compact = re.sub(r'\s+', '', body) + '=' * (-len(re.sub(r'\s+', '', body)) % 4)
     try:
         decoded = base64.b64decode(compact, validate=True).decode('utf-8')
-        lines = [line.strip() for line in decoded.splitlines() if is_node_link(line.strip())]
+        lines = [line.strip() for line in decoded.splitlines()
+                 if is_node_link(line.strip()) and not _is_ad_uri(line.strip())]
         if lines:
-            return list(dict.fromkeys(lines))
+            return lines
     except (ValueError, UnicodeError):
         pass
     if yaml is not None:
@@ -167,9 +190,11 @@ def decode_subscription(body):
             proxies = config.get('proxies', []) if isinstance(config, dict) else []
             result = []
             for proxy in proxies:
+                if isinstance(proxy, dict) and _is_ad_name(proxy.get('name')):
+                    continue
                 try: result.append(_node_uri(proxy))
                 except (ValueError, TypeError, KeyError): pass
-            return list(dict.fromkeys(result))
+            return result
         except yaml.YAMLError:
             pass
     return []
