@@ -245,8 +245,24 @@ class WulaTests(unittest.TestCase):
         register.assert_called_once()
         download.assert_called_once_with('fixture-new')
         saved = json.loads((Path(self.temp.name) / 'wula_bank.json').read_text())
+        self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]['token'], 'fixture-new')
         self.assertIn('fresh@hy.example.com', (Path(self.temp.name) / 'nodes.txt').read_text())
+
+    def test_expired_bank_subscription_failure_keeps_old_account(self):
+        old = {'email':'old@example.com','password':'old-password','token':'old-token'}
+        fresh = {'email':'fresh@example.com','password':'fresh-password','token':'new-token'}
+        bank = Path(self.temp.name) / 'wula_bank.json'; bank.write_text(json.dumps([old]))
+        with patch.object(w.sys,'argv',['wula.py','--outdir',self.temp.name]), \
+             patch.dict(os.environ,{'WULA_PROXY':'','WULA_MAX_ATTEMPTS':'1'}), \
+             patch.object(w,'_load_node_pool',return_value=[]), \
+             patch.object(w,'_bank_account_usable',return_value=(False,'套餐已到期')), \
+             patch.object(w,'_register_one',return_value=fresh), \
+             patch.object(w,'_mark_used'),patch.object(w,'_stop_node_proxy'), \
+             patch.object(w,'_fetch_nodes',return_value=(None,[],'temporary subscription failure')), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):w.main()
+        self.assertEqual(json.loads(bank.read_text()),[old])
 
     def test_reuse_bank_does_not_register(self):
         entry = {'email': 'fixture@example.com', 'password': 'fixture-password', 'token': 'fixture-token'}
