@@ -13,7 +13,7 @@ atvpn=importlib.util.module_from_spec(spec);spec.loader.exec_module(atvpn)
 
 class AtvpnPluginTests(unittest.TestCase):
     def test_interval_is_twelve_hours(self):
-        line=(ROOT/'plugins/atvpn.py').read_text().splitlines()[2]
+        line=PLUGIN.read_text().splitlines()[2]
         self.assertIn('@interval: 12h',line)
     def test_output_is_single_subscription_and_plain_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:
