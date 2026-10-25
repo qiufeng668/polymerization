@@ -5,6 +5,10 @@ on:
     - cron: '*/50 * * * *'
   workflow_dispatch:
     inputs:
+      force_wula_register:
+        description: '强制重新注册一个乌拉账号（验证注册链路）'
+        type: boolean
+        default: false
       wula_only:
         description: '只刷新乌拉，其它插件沿用缓存；不勾选则全量运行'
         type: boolean
@@ -30,7 +34,7 @@ jobs:
       - name: 'Prepare one valid Wula account (renew on ARM when expiring)'
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
-        run: python wula_account_prepare.py
+        run: python wula_account_prepare.py ${{ inputs.force_wula_register && '--force' || '' }}
 
   wula-account-fallback:
     needs: wula-account
@@ -46,7 +50,7 @@ jobs:
       - name: 'Fallback: prepare one valid Wula account on macOS'
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
-        run: python wula_account_prepare.py
+        run: python wula_account_prepare.py ${{ inputs.force_wula_register && '--force' || '' }}
 
   build-and-sync:
     needs: [wula-account, wula-account-fallback]

@@ -72,6 +72,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--token', default=os.environ.get('GIT_TOKEN') or os.environ.get('GITHUB_TOKEN'))
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--force', action='store_true', help='ignore reuse window and register once')
     args = parser.parse_args()
     if not args.token:
         raise SystemExit('missing GIT_TOKEN')
@@ -85,7 +86,7 @@ def main():
     rows, _ = load_remote_bank(session)
     log('BANK_ENTRIES=%d' % len(rows))
 
-    for entry in rows[:1]:
+    for entry in ([] if args.force else rows[:1]):
         if not isinstance(entry, dict):
             continue
         ok, reason = wula._bank_account_usable(entry)
