@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PRIVATE_REPO = 'qiufeng668/polymerization-1'
-RENEW_BEFORE_HOURS = 3
+RENEW_BEFORE_HOURS = 6
 
 
 def log(message):
@@ -94,8 +94,15 @@ def main():
         log('BANK_STATUS=%s age_hours=%s' % ('active' if ok else reason,
                                             round(age_h, 1) if age_h is not None else None))
         if ok and age_h is not None and age_h < 24 - RENEW_BEFORE_HOURS:
-            log('DECISION=reuse age_within_window=1')
-            return 0
+            # Freshness on the panel is not enough: verify the token still yields nodes.
+            try:
+                _t, reuse_nodes, reuse_err = wula._fetch_nodes(entry.get('token', ''))
+            except Exception as exc:
+                reuse_nodes, reuse_err = [], wula._error_text(exc)
+            if reuse_nodes and not reuse_err:
+                log('DECISION=reuse age_within_window=1 nodes=%d' % len(reuse_nodes))
+                return 0
+            log('DECISION=register reason=stale_subscription %s' % (reuse_err or 'empty'))
 
     log('DECISION=register reason=expired_or_near_expiry')
     account = None
