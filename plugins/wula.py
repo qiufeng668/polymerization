@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# @interval: 12h   (Actions 自动跑, 每次注册 1 个账号)
+# @interval: 6h   (Actions 自动跑, 每次注册 1 个账号)
 # -*- coding: utf-8 -*-
 """
 乌拉VPN：复用有效账号；无有效账号时注册一个，并验证订阅包含有效节点。

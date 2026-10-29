@@ -960,6 +960,9 @@ def run_plugins_with_cache():
         report["last_success"] = info.get("last_success", "从未成功")
         report["last_run"] = info.get("last_run", 0)
         report["cached"] = report["status"].startswith("⏭️") or report["fail_count"] > 0
+        # 冷却跳过时状态不会变绿也不会变红，必须单独暴露缓存年龄。
+        last_run_ts = float(info.get("last_run") or 0)
+        report["stale_hours"] = round((time.time() - last_run_ts) / 3600, 1) if last_run_ts else None
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     return all_raw_nodes, plugin_reports
@@ -1016,16 +1019,20 @@ def generate_dashboard(raw_count, unique_count, alive_count, clash_count, region
         ])
     lines.extend([
         "## 插件健康度",
-        "| 插件 | 周期 | 本轮状态 | 节点 | 连败 | 上次成功 | 说明 |",
-        "| :--- | :--- | :--- | ---: | ---: | :--- | :--- |",
+        "| 插件 | 周期 | 本轮状态 | 节点 | 连败 | 上次成功 | 距上次执行 | 说明 |",
+        "| :--- | :--- | :--- | ---: | ---: | :--- | ---: | :--- |",
     ])
     for p in plugin_reports:
         status_label = p['status']
         if p.get('cached'):
             status_label = '🟡 ' + status_label + '（缓存）'
         success = p.get('last_success') or '从未成功'
+        stale = p.get('stale_hours')
+        stale_label = '—' if stale is None else ('%sh 前' % stale if stale >= 1 else '刚刚')
+        if stale is not None and stale >= 12:
+            stale_label = '⚠️ ' + stale_label
         advice = p['advice']
-        lines.append(f"| `{p['name']}` | {p['interval']} | {status_label} | {p['count']} | {p['fail_count']} | {success} | {advice} |")
+        lines.append(f"| `{p['name']}` | {p['interval']} | {status_label} | {p['count']} | {p['fail_count']} | {success} | {stale_label} | {advice} |")
     lines.append("")
     if region_counters:
         lines.append("## 地区分布")
